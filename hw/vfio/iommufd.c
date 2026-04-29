@@ -306,38 +306,172 @@ out:
     return ret;
 }
 
-static int iommufd_cdev_pasid_attach_ioas_hwpt(VFIODevice *vbasedev,
-                                               uint32_t pasid, uint32_t id,
-                                               Error **errp)
+static int iommufd_cdev_open_path(const char *cdev_path, Error **errp)
+{
+    int fd;
+
+    fd = qemu_open(cdev_path, O_RDWR, errp);
+    trace_iommufd_cdev_getfd(cdev_path, fd);
+    return fd;
+}
+
+static bool iommufd_cdev_has_configured_pasid(VFIODevice *vbasedev)
+{
+    return vbasedev->pasid != VFIO_PASID_INVALID;
+}
+
+static bool iommufd_cdev_detach_ioas_hwpt(VFIODevice *vbasedev,
+                                          bool pasid_valid, uint32_t pasid,
+                                          Error **errp);
+
+static int iommufd_cdev_idxd_siov_pasid_feature_optional(
+    VFIODevice *vbasedev, uint32_t op, uint32_t guest_pasid,
+    uint32_t host_pasid, Error **errp)
+{
+    Error *local_err = NULL;
+    int ret;
+
+    ret = vfio_device_idxd_siov_pasid_feature(vbasedev, op, guest_pasid,
+                                              host_pasid, &local_err);
+    if (ret == -ENOTTY) {
+        error_free(local_err);
+        return 0;
+    }
+    if (ret) {
+        error_propagate(errp, local_err);
+    }
+
+    return ret;
+}
+
+static bool iommufd_cdev_select_host_pasid(VFIODevice *vbasedev,
+                                           HostIOMMUDevice *hiod,
+                                           uint32_t guest_pasid,
+                                           uint32_t *host_pasid,
+                                           Error **errp)
+{
+    uint64_t max_pasid;
+
+    if (*host_pasid != UINT32_MAX) {
+        return true;
+    }
+
+    if (vbasedev->host_pasid_base == VFIO_PASID_INVALID) {
+        *host_pasid = guest_pasid;
+        return true;
+    }
+
+    if (vbasedev->host_pasid_base == IOMMU_NO_PASID) {
+        error_setg(errp, "x-host-pasid-base must not be IOMMU_NO_PASID");
+        return false;
+    }
+
+    if (hiod->caps.max_pasid_log2 >= 32) {
+        max_pasid = (uint64_t)UINT32_MAX + 1;
+    } else {
+        max_pasid = 1ULL << hiod->caps.max_pasid_log2;
+    }
+
+    if (vbasedev->host_pasid_base >= max_pasid) {
+        error_setg(errp, "x-host-pasid-base %u exceeds host PASID limit %"PRIu64,
+                   vbasedev->host_pasid_base, max_pasid);
+        return false;
+    }
+
+    if (vbasedev->host_pasid_next == VFIO_PASID_INVALID) {
+        vbasedev->host_pasid_next = vbasedev->host_pasid_base;
+    }
+
+    while (vbasedev->host_pasid_next < max_pasid) {
+        uint32_t candidate = vbasedev->host_pasid_next++;
+
+        if (candidate == IOMMU_NO_PASID ||
+            candidate == vbasedev->pasid ||
+            candidate == VFIO_PASID_INVALID ||
+            iommufd_backend_host_pasid_allocated(vbasedev->iommufd,
+                                                 candidate)) {
+            continue;
+        }
+
+        *host_pasid = candidate;
+        iommufd_backend_host_pasid_mark_allocated(vbasedev->iommufd,
+                                                  candidate);
+        return true;
+    }
+
+    error_setg(errp, "no host PASIDs available starting at %u",
+               vbasedev->host_pasid_base);
+    return false;
+}
+
+static int iommufd_cdev_attach_ioas_hwpt(VFIODevice *vbasedev,
+                                         bool pasid_valid, uint32_t pasid,
+                                         uint32_t *id, Error **errp)
 {
     int iommufd = vbasedev->iommufd->fd;
     struct vfio_device_attach_iommufd_pt attach_data = {
         .argsz = sizeof(attach_data),
-        .flags = pasid == IOMMU_NO_PASID ? 0 : VFIO_DEVICE_ATTACH_PASID,
+        .flags = pasid_valid ? VFIO_DEVICE_ATTACH_PASID : 0,
         .pasid = pasid,
-        .pt_id = id,
+        .pt_id = *id,
     };
 
     /* Attach device to an IOAS or hwpt within iommufd */
     if (ioctl(vbasedev->fd, VFIO_DEVICE_ATTACH_IOMMUFD_PT, &attach_data)) {
         error_setg_errno(errp, errno,
                          "[iommufd=%d] error attach %s (%d) pasid %d to id=%d",
-                         iommufd, vbasedev->name, vbasedev->fd, pasid, id);
+                         iommufd, vbasedev->name, vbasedev->fd, pasid, *id);
         return -errno;
     }
 
+    *id = attach_data.pt_id;
     trace_iommufd_cdev_pasid_attach_ioas_hwpt(iommufd, vbasedev->name,
-                                              vbasedev->fd, pasid, id);
+                                              vbasedev->fd, pasid, *id);
     return 0;
 }
 
-static bool iommufd_cdev_pasid_detach_ioas_hwpt(VFIODevice *vbasedev,
-                                                uint32_t pasid, Error **errp)
+static int iommufd_cdev_pasid_attach_ioas_hwpt(VFIODevice *vbasedev,
+                                               uint32_t pasid, uint32_t id,
+                                               Error **errp)
+{
+    return iommufd_cdev_attach_ioas_hwpt(vbasedev, pasid != IOMMU_NO_PASID,
+                                         pasid, &id, errp);
+}
+
+static int iommufd_cdev_configured_pasid_attach_ioas_hwpt(VFIODevice *vbasedev,
+                                                          uint32_t *id,
+                                                          Error **errp)
+{
+    int ret;
+
+    ret = iommufd_cdev_attach_ioas_hwpt(vbasedev, true, vbasedev->pasid,
+                                        id, errp);
+    if (ret) {
+        return ret;
+    }
+
+    ret = iommufd_cdev_idxd_siov_pasid_feature_optional(
+        vbasedev, VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID_SET_DEFAULT, 0,
+        vbasedev->pasid, errp);
+    if (ret) {
+        Error *local_err = NULL;
+
+        iommufd_cdev_detach_ioas_hwpt(vbasedev, true, vbasedev->pasid,
+                                      &local_err);
+        error_free(local_err);
+    }
+
+    return ret;
+}
+
+static bool iommufd_cdev_detach_ioas_hwpt(VFIODevice *vbasedev,
+                                          bool pasid_valid, uint32_t pasid,
+                                          Error **errp)
 {
     int iommufd = vbasedev->iommufd->fd;
     struct vfio_device_detach_iommufd_pt detach_data = {
         .argsz = sizeof(detach_data),
-        .flags = pasid == IOMMU_NO_PASID ? 0 : VFIO_DEVICE_DETACH_PASID,
+        .flags = pasid_valid ? VFIO_DEVICE_DETACH_PASID : 0,
         .pasid = pasid,
     };
 
@@ -349,6 +483,21 @@ static bool iommufd_cdev_pasid_detach_ioas_hwpt(VFIODevice *vbasedev,
 
     trace_iommufd_cdev_pasid_detach_ioas_hwpt(iommufd, vbasedev->name, pasid);
     return true;
+}
+
+static bool iommufd_cdev_pasid_detach_ioas_hwpt(VFIODevice *vbasedev,
+                                                uint32_t pasid, Error **errp)
+{
+    return iommufd_cdev_detach_ioas_hwpt(vbasedev,
+                                         pasid != IOMMU_NO_PASID, pasid,
+                                         errp);
+}
+
+static bool iommufd_cdev_configured_pasid_detach_ioas_hwpt(VFIODevice *vbasedev,
+                                                           Error **errp)
+{
+    return iommufd_cdev_detach_ioas_hwpt(vbasedev, true, vbasedev->pasid,
+                                         errp);
 }
 
 static bool iommufd_cdev_autodomains_get(VFIODevice *vbasedev,
@@ -365,6 +514,64 @@ static bool iommufd_cdev_autodomains_get(VFIODevice *vbasedev,
     uint32_t hwpt_id;
     uint8_t max_pasid_log2 = 0;
     int ret;
+
+    if (iommufd_cdev_has_configured_pasid(vbasedev)) {
+        flags = IOMMU_HWPT_ALLOC_PASID;
+
+        if (cpr_is_incoming()) {
+            hwpt_id = vbasedev->cpr.hwpt_id;
+        } else {
+            /*
+             * A configured device PASID still needs the vIOMMU-requested
+             * HWPT shape.  With VT-d FLTS enabled, the vIOMMU later creates
+             * nested first-stage HWPTs from this parent.
+             */
+            if (vfio_device_get_viommu_flags_want_nesting(vbasedev)) {
+                if (!iommufd_backend_get_device_info(vbasedev->iommufd,
+                                                     vbasedev->devid, &type,
+                                                     &caps, sizeof(caps),
+                                                     &hw_caps,
+                                                     &max_pasid_log2, errp)) {
+                    return false;
+                }
+
+                flags |= IOMMU_HWPT_ALLOC_NEST_PARENT;
+
+                if (vfio_device_get_host_iommu_quirk_bypass_ro(vbasedev, type,
+                                                               &caps,
+                                                               sizeof(caps))) {
+                    bcontainer->bypass_ro = true;
+                }
+            }
+
+            if (!iommufd_backend_alloc_hwpt(iommufd, vbasedev->devid,
+                                            container->ioas_id, flags,
+                                            IOMMU_HWPT_DATA_NONE, 0, NULL,
+                                            &hwpt_id, errp)) {
+                return false;
+            }
+
+            ret = iommufd_cdev_configured_pasid_attach_ioas_hwpt(vbasedev,
+                                                                 &hwpt_id,
+                                                                 errp);
+            if (ret) {
+                iommufd_backend_free_id(container->be, hwpt_id);
+                return false;
+            }
+        }
+
+        hwpt = g_malloc0(sizeof(*hwpt));
+        hwpt->hwpt_id = hwpt_id;
+        hwpt->hwpt_flags = flags;
+        QLIST_INIT(&hwpt->device_list);
+
+        vbasedev->hwpt = hwpt;
+        vbasedev->cpr.hwpt_id = hwpt->hwpt_id;
+        vbasedev->iommu_dirty_tracking = false;
+        QLIST_INSERT_HEAD(&hwpt->device_list, vbasedev, hwpt_next);
+        QLIST_INSERT_HEAD(&container->hwpt_list, hwpt, next);
+        return true;
+    }
 
     /* Try to find a domain */
     QLIST_FOREACH(hwpt, &container->hwpt_list, next) {
@@ -486,7 +693,9 @@ static void iommufd_cdev_autodomains_put(VFIODevice *vbasedev,
 
     if (QLIST_EMPTY(&hwpt->device_list)) {
         QLIST_REMOVE(hwpt, next);
-        iommufd_backend_free_id(container->be, hwpt->hwpt_id);
+        if (hwpt->hwpt_id != container->ioas_id) {
+            iommufd_backend_free_id(container->be, hwpt->hwpt_id);
+        }
         g_free(hwpt);
     }
 }
@@ -495,15 +704,24 @@ static bool iommufd_cdev_attach_container(VFIODevice *vbasedev,
                                           VFIOIOMMUFDContainer *container,
                                           Error **errp)
 {
+    uint32_t ioas_id = container->ioas_id;
+
     /* mdevs aren't physical devices and will fail with auto domains */
     if (!vbasedev->mdev) {
         return iommufd_cdev_autodomains_get(vbasedev, container, errp);
     }
 
     /* If CPR, we are already attached to ioas_id. */
+    if (iommufd_cdev_has_configured_pasid(vbasedev)) {
+        return cpr_is_incoming() ||
+               !iommufd_cdev_configured_pasid_attach_ioas_hwpt(vbasedev,
+                                                               &ioas_id,
+                                                               errp);
+    }
+
     return cpr_is_incoming() ||
            !iommufd_cdev_pasid_attach_ioas_hwpt(vbasedev, IOMMU_NO_PASID,
-                                                container->ioas_id, errp);
+                                                ioas_id, errp);
 }
 
 static void iommufd_cdev_detach_container(VFIODevice *vbasedev,
@@ -511,7 +729,12 @@ static void iommufd_cdev_detach_container(VFIODevice *vbasedev,
 {
     Error *err = NULL;
 
-    if (!iommufd_cdev_pasid_detach_ioas_hwpt(vbasedev, IOMMU_NO_PASID, &err)) {
+    if (iommufd_cdev_has_configured_pasid(vbasedev)) {
+        if (!iommufd_cdev_configured_pasid_detach_ioas_hwpt(vbasedev, &err)) {
+            error_report_err(err);
+        }
+    } else if (!iommufd_cdev_pasid_detach_ioas_hwpt(vbasedev, IOMMU_NO_PASID,
+                                                    &err)) {
         error_report_err(err);
     }
 
@@ -601,7 +824,11 @@ static bool iommufd_cdev_attach(const char *name, VFIODevice *vbasedev,
     vfio_cpr_load_device(vbasedev);
 
     if (vbasedev->fd < 0) {
-        devfd = iommufd_cdev_getfd(vbasedev->sysfsdev, errp);
+        if (vbasedev->cdev) {
+            devfd = iommufd_cdev_open_path(vbasedev->cdev, errp);
+        } else {
+            devfd = iommufd_cdev_getfd(vbasedev->sysfsdev, errp);
+        }
         if (devfd < 0) {
             return false;
         }
@@ -942,12 +1169,76 @@ host_iommu_device_iommufd_vfio_attach_hwpt(HostIOMMUDeviceIOMMUFD *hiodi,
 }
 
 static bool
+host_iommu_device_iommufd_vfio_attach_guest_pasid_hwpt(
+    HostIOMMUDeviceIOMMUFD *hiodi, uint32_t guest_pasid, uint32_t hwpt_id,
+    uint32_t *host_pasid, Error **errp)
+{
+    HostIOMMUDevice *hiod = HOST_IOMMU_DEVICE(hiodi);
+    VFIODevice *vbasedev = hiod->agent;
+    uint32_t selected_host_pasid = *host_pasid;
+    Error *local_err = NULL;
+    bool selected_new_host_pasid;
+    int ret;
+
+    selected_new_host_pasid = selected_host_pasid == UINT32_MAX &&
+                              vbasedev->host_pasid_base != VFIO_PASID_INVALID;
+
+    if (!iommufd_cdev_select_host_pasid(vbasedev, hiod, guest_pasid,
+                                        &selected_host_pasid, errp)) {
+        return false;
+    }
+
+    ret = iommufd_cdev_pasid_attach_ioas_hwpt(vbasedev, selected_host_pasid,
+                                              hwpt_id, errp);
+    if (ret) {
+        if (selected_new_host_pasid) {
+            iommufd_backend_host_pasid_release(vbasedev->iommufd,
+                                               selected_host_pasid);
+        }
+        return false;
+    }
+
+    ret = iommufd_cdev_idxd_siov_pasid_feature_optional(
+        vbasedev, VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID_MAP, guest_pasid,
+        selected_host_pasid, errp);
+    if (ret) {
+        iommufd_cdev_pasid_detach_ioas_hwpt(vbasedev, selected_host_pasid,
+                                            &local_err);
+        error_free(local_err);
+        if (selected_new_host_pasid) {
+            iommufd_backend_host_pasid_release(vbasedev->iommufd,
+                                               selected_host_pasid);
+        }
+        return false;
+    }
+
+    *host_pasid = selected_host_pasid;
+    return true;
+}
+
+static bool
 host_iommu_device_iommufd_vfio_detach_hwpt(HostIOMMUDeviceIOMMUFD *hiodi,
                                            uint32_t pasid, Error **errp)
 {
     VFIODevice *vbasedev = HOST_IOMMU_DEVICE(hiodi)->agent;
 
     return iommufd_cdev_pasid_detach_ioas_hwpt(vbasedev, pasid, errp);
+}
+
+static bool
+host_iommu_device_iommufd_vfio_detach_guest_pasid_hwpt(
+    HostIOMMUDeviceIOMMUFD *hiodi, uint32_t guest_pasid, uint32_t host_pasid,
+    Error **errp)
+{
+    VFIODevice *vbasedev = HOST_IOMMU_DEVICE(hiodi)->agent;
+
+    /*
+     * The idxd kernel side removes explicit guest PASID mappings when the
+     * host PASID is detached. Avoid a separate UNMAP here because the guest
+     * can still have enabled WQs, in which case UNMAP intentionally returns
+     * -EBUSY while PASID detach restores the affected WQ state.
+     */
+    return iommufd_cdev_pasid_detach_ioas_hwpt(vbasedev, host_pasid, errp);
 }
 
 static bool hiod_iommufd_vfio_realize(HostIOMMUDevice *hiod, void *opaque,
@@ -1011,7 +1302,11 @@ static void hiod_iommufd_vfio_class_init(ObjectClass *oc, const void *data)
     hiodc->get_page_size_mask = hiod_iommufd_vfio_get_page_size_mask;
 
     hiodic->attach_hwpt = host_iommu_device_iommufd_vfio_attach_hwpt;
+    hiodic->attach_guest_pasid_hwpt =
+        host_iommu_device_iommufd_vfio_attach_guest_pasid_hwpt;
     hiodic->detach_hwpt = host_iommu_device_iommufd_vfio_detach_hwpt;
+    hiodic->detach_guest_pasid_hwpt =
+        host_iommu_device_iommufd_vfio_detach_guest_pasid_hwpt;
 };
 
 static const TypeInfo types[] = {

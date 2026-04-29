@@ -3038,7 +3038,13 @@ bool vfio_pci_populate_device(VFIOPCIDevice *vdev, Error **errp)
         return false;
     }
 
-    if (vbasedev->num_irqs < VFIO_PCI_MSIX_IRQ_INDEX + 1) {
+    /*
+     * idxd SIOV VDEVs are currently exposed without interrupt
+     * virtualization. Allow the cdev path to model a polling-only device
+     * while the normal host PCI path keeps the existing sanity check.
+     */
+    if (!vbasedev->cdev &&
+        vbasedev->num_irqs < VFIO_PCI_MSIX_IRQ_INDEX + 1) {
         error_setg(errp, "unexpected number of irqs %u", vbasedev->num_irqs);
         return false;
     }
@@ -3457,12 +3463,21 @@ static void vfio_pci_realize(PCIDevice *pdev, Error **errp)
     char uuid[UUID_STR_LEN];
     g_autofree char *name = NULL;
 
-    if (vbasedev->fd < 0 && !vbasedev->sysfsdev) {
+    if (vbasedev->cdev &&
+        (vbasedev->fd >= 0 || vbasedev->sysfsdev ||
+         (~vdev->host.domain || ~vdev->host.bus ||
+          ~vdev->host.slot || ~vdev->host.function))) {
+        error_setg(errp, "cdev cannot be combined with fd, sysfsdev, or host");
+        return;
+    }
+
+    if (vbasedev->fd < 0 && !vbasedev->sysfsdev && !vbasedev->cdev) {
         if (!(~vdev->host.domain || ~vdev->host.bus ||
               ~vdev->host.slot || ~vdev->host.function)) {
             error_setg(errp, "No provided host device");
             error_append_hint(errp, "Use -device vfio-pci,host=DDDD:BB:DD.F "
                               "or -device vfio-pci,fd=DEVICE_FD "
+                              "or -device vfio-pci,cdev=/dev/vfio/devices/vfioX "
                               "or -device vfio-pci,sysfsdev=PATH_TO_DEVICE\n");
             return;
         }
@@ -3470,6 +3485,20 @@ static void vfio_pci_realize(PCIDevice *pdev, Error **errp)
             g_strdup_printf("/sys/bus/pci/devices/%04x:%02x:%02x.%01x",
                             vdev->host.domain, vdev->host.bus,
                             vdev->host.slot, vdev->host.function);
+    }
+
+    if (vbasedev->cdev && !vbasedev->iommufd) {
+        error_setg(errp, "cdev requires an iommufd object");
+        return;
+    }
+    if (vbasedev->pasid != VFIO_PASID_INVALID && !vbasedev->iommufd) {
+        error_setg(errp, "x-pasid requires an iommufd object");
+        return;
+    }
+    if (vbasedev->host_pasid_base != VFIO_PASID_INVALID &&
+        !vbasedev->iommufd) {
+        error_setg(errp, "x-host-pasid-base requires an iommufd object");
+        return;
     }
 
     if (!vfio_device_get_name(vbasedev, errp)) {
@@ -3805,6 +3834,11 @@ static const Property vfio_pci_properties[] = {
                                    qdev_prop_nv_gpudirect_clique, uint8_t),
     DEFINE_PROP_OFF_AUTO_PCIBAR("x-msix-relocation", VFIOPCIDevice, msix_relo,
                                 OFF_AUTO_PCIBAR_OFF),
+    DEFINE_PROP_STRING("cdev", VFIOPCIDevice, vbasedev.cdev),
+    DEFINE_PROP_UINT32("x-pasid", VFIOPCIDevice, vbasedev.pasid,
+                       VFIO_PASID_INVALID),
+    DEFINE_PROP_UINT32("x-host-pasid-base", VFIOPCIDevice,
+                       vbasedev.host_pasid_base, VFIO_PASID_INVALID),
     DEFINE_PROP_LINK("iommufd", VFIOPCIDevice, vbasedev.iommufd,
                      TYPE_IOMMUFD_BACKEND, IOMMUFDBackend *),
     DEFINE_PROP_BOOL("skip-vsc-check", VFIOPCIDevice, skip_vsc_check, true),

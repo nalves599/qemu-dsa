@@ -33,6 +33,7 @@
 #include "system/iommufd.h"
 
 #define VFIO_MSG_PREFIX "vfio %s: "
+#define VFIO_PASID_INVALID UINT32_MAX
 
 enum {
     VFIO_DEVICE_TYPE_PCI = 0,
@@ -56,6 +57,7 @@ typedef struct VFIODevice {
     struct VFIOGroup *group;
     VFIOContainer *bcontainer;
     char *sysfsdev;
+    char *cdev;
     char *name;
     DeviceState *dev;
     int fd;
@@ -85,6 +87,9 @@ typedef struct VFIODevice {
     bool iommu_dirty_tracking;
     HostIOMMUDevice *hiod;
     int devid;
+    uint32_t pasid;
+    uint32_t host_pasid_base;
+    uint32_t host_pasid_next;
     IOMMUFDBackend *iommufd;
     VFIOIOASHwpt *hwpt;
     QLIST_ENTRY(VFIODevice) hwpt_next;
@@ -275,6 +280,9 @@ bool vfio_device_get_host_iommu_quirk_bypass_ro(VFIODevice *vbasedev,
 
 int vfio_device_get_feature(VFIODevice *vbasedev,
                             struct vfio_device_feature *feature);
+int vfio_device_idxd_siov_pasid_feature(VFIODevice *vbasedev, uint32_t op,
+                                        uint32_t guest_pasid,
+                                        uint32_t host_pasid, Error **errp);
 
 /**
  * Return the region info for a given region index. The region info includes

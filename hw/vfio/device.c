@@ -316,6 +316,22 @@ bool vfio_device_get_name(VFIODevice *vbasedev, Error **errp)
     struct stat st;
 
     if (vbasedev->fd < 0) {
+        if (vbasedev->cdev) {
+            if (!vbasedev->iommufd) {
+                error_setg(errp, "Use cdev only with iommufd backend");
+                return false;
+            }
+            if (stat(vbasedev->cdev, &st) < 0) {
+                error_setg_errno(errp, errno, "no such VFIO cdev");
+                error_prepend(errp, VFIO_MSG_PREFIX, vbasedev->cdev);
+                return false;
+            }
+            if (!vbasedev->name) {
+                vbasedev->name = g_path_get_basename(vbasedev->cdev);
+            }
+            return true;
+        }
+
         if (stat(vbasedev->sysfsdev, &st) < 0) {
             error_setg_errno(errp, errno, "no such host device");
             error_prepend(errp, VFIO_MSG_PREFIX, vbasedev->sysfsdev);
@@ -376,6 +392,9 @@ void vfio_device_init(VFIODevice *vbasedev, int type, VFIODeviceOps *ops,
     vbasedev->io_ops = &vfio_device_io_ops_ioctl;
     vbasedev->dev = dev;
     vbasedev->fd = -1;
+    vbasedev->pasid = VFIO_PASID_INVALID;
+    vbasedev->host_pasid_base = VFIO_PASID_INVALID;
+    vbasedev->host_pasid_next = VFIO_PASID_INVALID;
     vbasedev->use_region_fds = false;
 
     vbasedev->ram_block_discard_allowed = ram_discard;
@@ -565,6 +584,36 @@ int vfio_device_get_feature(VFIODevice *vbasedev,
         return -EINVAL;
     }
     return vbasedev->io_ops->device_feature(vbasedev, feature);
+}
+
+int vfio_device_idxd_siov_pasid_feature(VFIODevice *vbasedev, uint32_t op,
+                                        uint32_t guest_pasid,
+                                        uint32_t host_pasid, Error **errp)
+{
+    uint64_t buf[DIV_ROUND_UP(sizeof(struct vfio_device_feature) +
+                              sizeof(struct vfio_device_feature_idxd_siov_pasid),
+                              sizeof(uint64_t))] = {};
+    struct vfio_device_feature *feature = (struct vfio_device_feature *)buf;
+    struct vfio_device_feature_idxd_siov_pasid *pasid =
+        (struct vfio_device_feature_idxd_siov_pasid *)feature->data;
+    int ret;
+
+    feature->argsz = sizeof(*feature) + sizeof(*pasid);
+    feature->flags = VFIO_DEVICE_FEATURE_SET |
+                     VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID;
+    pasid->op = op;
+    pasid->guest_pasid = guest_pasid;
+    pasid->host_pasid = host_pasid;
+
+    ret = vfio_device_get_feature(vbasedev, feature);
+    if (ret) {
+        error_setg_errno(errp, -ret,
+                         "idxd SIOV PASID feature op %u guest PASID %u "
+                         "host PASID %u failed",
+                         op, guest_pasid, host_pasid);
+    }
+
+    return ret;
 }
 
 /*
