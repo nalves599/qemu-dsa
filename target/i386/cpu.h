@@ -627,6 +627,7 @@ typedef enum X86Seg {
 #define XSTATE_Hi16_ZMM_BIT             7
 #define XSTATE_PT_BIT                   8
 #define XSTATE_PKRU_BIT                 9
+#define XSTATE_PASID_BIT                10
 #define XSTATE_CET_U_BIT                11
 #define XSTATE_CET_S_BIT                12
 #define XSTATE_ARCH_LBR_BIT             15
@@ -644,6 +645,7 @@ typedef enum X86Seg {
 #define XSTATE_Hi16_ZMM_MASK            (1ULL << XSTATE_Hi16_ZMM_BIT)
 #define XSTATE_PT_MASK                  (1ULL << XSTATE_PT_BIT)
 #define XSTATE_PKRU_MASK                (1ULL << XSTATE_PKRU_BIT)
+#define XSTATE_PASID_MASK               (1ULL << XSTATE_PASID_BIT)
 #define XSTATE_CET_U_MASK               (1ULL << XSTATE_CET_U_BIT)
 #define XSTATE_CET_S_MASK               (1ULL << XSTATE_CET_S_BIT)
 #define XSTATE_ARCH_LBR_MASK            (1ULL << XSTATE_ARCH_LBR_BIT)
@@ -670,8 +672,8 @@ typedef enum X86Seg {
                                  XSTATE_XTILE_DATA_MASK | XSTATE_APX_MASK)
 
 /* CPUID feature bits available in XSS */
-#define CPUID_XSTATE_XSS_MASK   (XSTATE_ARCH_LBR_MASK | XSTATE_CET_U_MASK | \
-                                 XSTATE_CET_S_MASK)
+#define CPUID_XSTATE_XSS_MASK   (XSTATE_ARCH_LBR_MASK | XSTATE_PASID_MASK | \
+                                 XSTATE_CET_U_MASK | XSTATE_CET_S_MASK)
 
 #define CPUID_XSTATE_MASK       (CPUID_XSTATE_XCR0_MASK | CPUID_XSTATE_XSS_MASK)
 
@@ -981,6 +983,8 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w);
 #define CPUID_7_0_ECX_MOVDIRI           (1U << 27)
 /* Move 64 Bytes as Direct Store Instruction */
 #define CPUID_7_0_ECX_MOVDIR64B         (1U << 28)
+/* ENQCMD and ENQCMDS Instructions */
+#define CPUID_7_0_ECX_ENQCMD            (1U << 29)
 /* Support SGX Launch Control */
 #define CPUID_7_0_ECX_SGX_LC            (1U << 30)
 /* Protection Keys for Supervisor-mode Pages */
@@ -1846,6 +1850,11 @@ typedef struct XSavePKRU {
     uint32_t padding;
 } XSavePKRU;
 
+/* Ext. save area 10: PASID state */
+typedef struct XSavePASID {
+    uint64_t pasid;
+} XSavePASID;
+
 /* Ext. save area 11: CET_U state */
 typedef struct XSaveCETU {
     uint64_t u_cet;
@@ -1891,6 +1900,7 @@ QEMU_BUILD_BUG_ON(sizeof(XSaveOpmask) != 0x40);
 QEMU_BUILD_BUG_ON(sizeof(XSaveZMM_Hi256) != 0x200);
 QEMU_BUILD_BUG_ON(sizeof(XSaveHi16_ZMM) != 0x400);
 QEMU_BUILD_BUG_ON(sizeof(XSavePKRU) != 0x8);
+QEMU_BUILD_BUG_ON(sizeof(XSavePASID) != 0x8);
 QEMU_BUILD_BUG_ON(sizeof(XSaveCETU) != 0x10);
 QEMU_BUILD_BUG_ON(sizeof(XSaveCETS) != 0x18);
 QEMU_BUILD_BUG_ON(sizeof(XSaveArchLBR) != 0x328);

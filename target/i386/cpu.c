@@ -1207,7 +1207,7 @@ FeatureWordInfo feature_word_info[FEATURE_WORDS] = {
             "la57", NULL, NULL, NULL,
             NULL, NULL, "rdpid", NULL,
             "bus-lock-detect", "cldemote", NULL, "movdiri",
-            "movdir64b", NULL, "sgxlc", "pks",
+            "movdir64b", "enqcmd", "sgxlc", "pks",
         },
         .cpuid = {
             .eax = 7,
@@ -1501,7 +1501,7 @@ FeatureWordInfo feature_word_info[FEATURE_WORDS] = {
         .feat_names = {
             NULL, NULL, NULL, NULL,
             NULL, NULL, NULL, NULL,
-            NULL, NULL, NULL, NULL,
+            NULL, NULL, "pasid", NULL,
             NULL, NULL, NULL, NULL,
             NULL, NULL, NULL, NULL,
             NULL, NULL, NULL, NULL,
@@ -1514,8 +1514,8 @@ FeatureWordInfo feature_word_info[FEATURE_WORDS] = {
             .ecx = 1,
             .reg = R_ECX,
         },
-        .migratable_flags = XSTATE_CET_U_MASK | XSTATE_CET_S_MASK |
-            XSTATE_ARCH_LBR_MASK,
+        .migratable_flags = XSTATE_PASID_MASK | XSTATE_CET_U_MASK |
+            XSTATE_CET_S_MASK | XSTATE_ARCH_LBR_MASK,
     },
     [FEAT_XSAVE_XSS_HI] = {
         .type = CPUID_FEATURE_WORD,
@@ -2125,6 +2125,12 @@ ExtSaveArea x86_ext_save_areas[XSAVE_STATE_AREA_COUNT] = {
         .size = sizeof(XSavePKRU),
         .features = {
             { FEAT_7_0_ECX,         CPUID_7_0_ECX_PKU },
+        },
+    },
+    [XSTATE_PASID_BIT] = {
+        .size = sizeof(XSavePASID),
+        .features = {
+            { FEAT_7_0_ECX,         CPUID_7_0_ECX_ENQCMD },
         },
     },
     [XSTATE_CET_U_BIT] = {
