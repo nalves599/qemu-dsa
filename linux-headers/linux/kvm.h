@@ -180,6 +180,7 @@ struct kvm_xen_exit {
 #define KVM_EXIT_MEMORY_FAULT     39
 #define KVM_EXIT_TDX              40
 #define KVM_EXIT_ARM_SEA          41
+#define KVM_EXIT_X86_PASID_TRANSLATION 41
 
 /* For KVM_EXIT_INTERNAL_ERROR */
 /* Emulate instruction failed. */
@@ -474,6 +475,12 @@ struct kvm_run {
 			__u64 gva;
 			__u64 gpa;
 		} arm_sea;
+		/* KVM_EXIT_X86_PASID_TRANSLATION */
+		struct {
+			__u32 reason;
+			__u32 guest_pasid;
+			__u64 qualification;
+		} x86_pasid_translation;
 		/* Fix the size of the union. */
 		char padding[256];
 	};
@@ -963,6 +970,7 @@ struct kvm_enable_cap {
 #define KVM_CAP_ARM_EL2_E2H0 241
 #define KVM_CAP_RISCV_MP_STATE_RESET 242
 #define KVM_CAP_ARM_CACHEABLE_PFNMAP_SUPPORTED 243
+#define KVM_CAP_X86_PASID_TRANSLATION 245
 #define KVM_CAP_GUEST_MEMFD_FLAGS 244
 #define KVM_CAP_ARM_SEA_TO_USER 245
 #define KVM_CAP_S390_USER_OPEREXEC 246
@@ -1600,6 +1608,20 @@ struct kvm_memory_attributes {
 };
 
 #define KVM_MEMORY_ATTRIBUTE_PRIVATE           (1ULL << 3)
+
+#define KVM_X86_PASID_TRANSLATION_ENABLE	(1U << 0)
+#define KVM_X86_PASID_TRANSLATION_DISABLE	(1U << 1)
+#define KVM_X86_PASID_TRANSLATION_MAP		(1U << 2)
+#define KVM_X86_PASID_TRANSLATION_UNMAP		(1U << 3)
+
+struct kvm_x86_pasid_translation {
+	__u32 flags;
+	__u32 guest_pasid;
+	__u32 host_pasid;
+	__u32 pad;
+};
+
+#define KVM_X86_SET_PASID_TRANSLATION	_IOW(KVMIO, 0xd3, struct kvm_x86_pasid_translation)
 
 #define KVM_CREATE_GUEST_MEMFD	_IOWR(KVMIO,  0xd4, struct kvm_create_guest_memfd)
 #define GUEST_MEMFD_FLAG_MMAP		(1ULL << 0)

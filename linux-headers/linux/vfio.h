@@ -1506,6 +1506,25 @@ struct vfio_device_feature_dma_buf {
 	struct vfio_region_dma_range dma_ranges[] __counted_by(nr_ranges);
 };
 
+/*
+ * Intel DSA SIOV PASID control for idxd VFIO VDEVs. Host PASIDs are attached
+ * to iommufd page tables with VFIO_DEVICE_ATTACH_IOMMUFD_PT and
+ * VFIO_DEVICE_ATTACH_PASID. This feature supplies the VDEV-local policy that
+ * is not expressed by the generic attach.
+ */
+struct vfio_device_feature_idxd_siov_pasid {
+	__u32 op;
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID_MAP			0
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID_UNMAP		1
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID_SET_DEFAULT		2
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID_CLEAR_DEFAULT	3
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID_GET_DEFAULT		4
+	__u32 guest_pasid;
+	__u32 host_pasid;
+	__u32 __reserved;
+};
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID 12
+
 /* -------- API for Type1 VFIO IOMMU -------- */
 
 /**
