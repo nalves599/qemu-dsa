@@ -21,11 +21,14 @@ enum viommu_flags {
     /* vIOMMU needs nesting parent HWPT to create nested HWPT */
     VIOMMU_FLAG_WANT_NESTING_PARENT = BIT_ULL(0),
     VIOMMU_FLAG_PASID_SUPPORTED = BIT_ULL(1),
+    VIOMMU_FLAG_WANT_PASID_ATTACH = BIT_ULL(2),
 };
 
 /* Host IOMMU quirks. Extracted from host IOMMU capabilities */
 enum host_iommu_quirks {
     HOST_IOMMU_QUIRK_NESTING_PARENT_BYPASS_RO = BIT_ULL(0),
 };
+
+#define IOMMU_NO_PASID 0
 
 #endif /* HW_IOMMU_H */
