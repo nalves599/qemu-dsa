@@ -304,6 +304,7 @@ struct IntelIOMMUState {
     QLIST_HEAD(, VTDAddressSpace) vtd_as_with_notifiers;
 
     GHashTable *vtd_host_iommu_dev;             /* VTDHostIOMMUDevice */
+    GHashTable *vtd_pasid_translation;          /* guest PASID -> host PASID */
 
     /* interrupt remapping */
     bool intr_enabled;              /* Whether guest enabled IR */
@@ -314,6 +315,30 @@ struct IntelIOMMUState {
     uint8_t aw_bits;                /* Host/IOVA address width (in bits) */
     uint8_t pasid;                  /* PASID supported in bits, 0 if not */
     bool fs1gp;                     /* First Stage 1-GByte Page Support */
+
+    /*
+     * Test knob for KVM PASID-translation exits.  When enabled, QEMU skips
+     * proactive host PASID attachment replay for selected guest PASIDs and
+     * lets the first ENQCMD/S fault drive the mapping through KVM.
+     */
+    bool pasid_translation_lazy;
+    uint32_t pasid_translation_lazy_pasid;
+    uint64_t pasid_translation_exits;
+    uint64_t pasid_translation_exit_maps;
+    uint64_t pasid_translation_exit_failures;
+    uint64_t pasid_translation_replay_skips;
+    uint64_t pasid_translation_selects;
+    uint64_t pasid_translation_reuses;
+    uint64_t pasid_translation_nested_hwpt_allocs;
+    uint64_t pasid_translation_nested_hwpt_reuses;
+    uint64_t pasid_translation_nested_hwpt_frees;
+    uint64_t pasid_translation_kvm_maps;
+    uint64_t pasid_translation_kvm_unmaps;
+    uint64_t pasid_translation_attaches;
+    uint64_t pasid_translation_detaches;
+    uint64_t pasid_translation_final_detaches;
+    uint64_t pasid_translation_host_pasid_releases;
+    uint64_t pasid_translation_stale_invalidations;
 
     /* Transient Mapping, Reserved(0) since VTD spec revision 3.2 */
     bool stale_tm;

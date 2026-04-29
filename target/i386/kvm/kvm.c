@@ -57,6 +57,7 @@
 #include "hw/i386/apic_internal.h"
 #include "hw/i386/apic-msidef.h"
 #include "hw/i386/intel_iommu.h"
+#include "hw/i386/intel_iommu_accel.h"
 #include "hw/i386/topology.h"
 #include "hw/i386/x86-iommu.h"
 #include "hw/i386/e820_memory_layout.h"
@@ -6613,6 +6614,19 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
         assert(run->msr.reason == KVM_MSR_EXIT_REASON_FILTER);
         ret = kvm_handle_wrmsr(cpu, run);
         break;
+    case KVM_EXIT_X86_PASID_TRANSLATION: {
+        Error *local_err = NULL;
+
+        bql_lock();
+        ret = vtd_accel_handle_pasid_translation_exit(
+            run->x86_pasid_translation.guest_pasid, &local_err) ? 0 : -1;
+        bql_unlock();
+        if (ret) {
+            error_reportf_err(local_err,
+                              "KVM PASID translation exit failed: ");
+        }
+        break;
+    }
 #ifdef CONFIG_XEN_EMU
     case KVM_EXIT_XEN:
         ret = kvm_xen_handle_exit(cpu, &run->xen);

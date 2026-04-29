@@ -9,12 +9,308 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
 #include "system/iommufd.h"
+#include "system/kvm.h"
 #include "intel_iommu_internal.h"
 #include "intel_iommu_accel.h"
 #include "hw/core/iommu.h"
 #include "hw/pci/pci_bus.h"
 #include "trace.h"
+
+static bool vtd_kvm_pasid_translation(uint32_t flags, uint32_t guest_pasid,
+                                      uint32_t host_pasid, Error **errp)
+{
+#ifdef CONFIG_KVM
+    struct kvm_x86_pasid_translation cfg = {
+        .flags = flags,
+        .guest_pasid = guest_pasid,
+        .host_pasid = host_pasid,
+    };
+    int ret;
+
+    if (!kvm_enabled()) {
+        return true;
+    }
+
+    if (!kvm_check_extension(kvm_state, KVM_CAP_X86_PASID_TRANSLATION)) {
+        error_setg(errp, "KVM does not support x86 PASID translation");
+        return false;
+    }
+
+    ret = kvm_vm_ioctl(kvm_state, KVM_X86_SET_PASID_TRANSLATION, &cfg);
+    if (ret) {
+        error_setg_errno(errp, -ret,
+                         "KVM PASID translation op %#x guest PASID %u host PASID %u failed",
+                         flags, guest_pasid, host_pasid);
+        return false;
+    }
+#endif
+    return true;
+}
+
+typedef struct VTDPASIDTranslation {
+    IntelIOMMUState *iommu_state;
+    uint32_t guest_pasid;
+    uint32_t host_pasid;
+    uint32_t fs_hwpt_id;
+    IOMMUFDBackend *host_pasid_iommufd;
+    IOMMUFDBackend *fs_hwpt_iommufd;
+    bool host_pasid_valid;
+    bool fs_hwpt_valid;
+    bool kvm_mapped;
+    unsigned int users;
+} VTDPASIDTranslation;
+
+static GHashTable *vtd_pasid_translation_cache(IntelIOMMUState *s)
+{
+    if (!s->vtd_pasid_translation) {
+        s->vtd_pasid_translation = g_hash_table_new_full(g_direct_hash,
+                                                         g_direct_equal, NULL,
+                                                         g_free);
+    }
+
+    return s->vtd_pasid_translation;
+}
+
+static VTDPASIDTranslation *
+vtd_pasid_translation_lookup(IntelIOMMUState *s, uint32_t guest_pasid)
+{
+    return g_hash_table_lookup(vtd_pasid_translation_cache(s),
+                               GUINT_TO_POINTER(guest_pasid));
+}
+
+static bool vtd_pasid_translation_host_in_use(IntelIOMMUState *s,
+                                              uint32_t guest_pasid,
+                                              uint32_t host_pasid)
+{
+    GHashTableIter iter;
+    VTDPASIDTranslation *translation;
+
+    g_hash_table_iter_init(&iter, vtd_pasid_translation_cache(s));
+    while (g_hash_table_iter_next(&iter, NULL, (void **)&translation)) {
+        if (translation->guest_pasid != guest_pasid &&
+            translation->host_pasid_valid &&
+            translation->host_pasid == host_pasid) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static VTDPASIDTranslation *
+vtd_pasid_translation_get_or_create(IntelIOMMUState *s, uint32_t guest_pasid)
+{
+    VTDPASIDTranslation *translation;
+
+    translation = vtd_pasid_translation_lookup(s, guest_pasid);
+    if (translation) {
+        return translation;
+    }
+
+    translation = g_new0(VTDPASIDTranslation, 1);
+    translation->iommu_state = s;
+    translation->guest_pasid = guest_pasid;
+    translation->host_pasid = UINT32_MAX;
+    g_hash_table_insert(vtd_pasid_translation_cache(s),
+                        GUINT_TO_POINTER(guest_pasid), translation);
+    return translation;
+}
+
+static void vtd_pasid_translation_free_fs_hwpt(VTDPASIDTranslation *translation)
+{
+    IntelIOMMUState *s = translation->iommu_state;
+
+    if (!translation->fs_hwpt_valid) {
+        return;
+    }
+
+    if (s) {
+        s->pasid_translation_nested_hwpt_frees++;
+        trace_vtd_pasid_translation_nested_hwpt_free(
+            translation->guest_pasid, translation->host_pasid,
+            translation->fs_hwpt_id, translation->users,
+            s->pasid_translation_nested_hwpt_frees);
+    }
+    warn_report("VT-d PASID translation free nested HWPT: guest PASID %u "
+                "host PASID %u hwpt %u users=%u",
+                translation->guest_pasid, translation->host_pasid,
+                translation->fs_hwpt_id, translation->users);
+    iommufd_backend_free_id(translation->fs_hwpt_iommufd,
+                            translation->fs_hwpt_id);
+    translation->fs_hwpt_id = 0;
+    translation->fs_hwpt_iommufd = NULL;
+    translation->fs_hwpt_valid = false;
+}
+
+static void vtd_pasid_translation_release_host_pasid(
+    VTDPASIDTranslation *translation)
+{
+    IntelIOMMUState *s = translation->iommu_state;
+    uint32_t host_pasid;
+
+    if (!translation->host_pasid_valid || !translation->host_pasid_iommufd) {
+        return;
+    }
+
+    host_pasid = translation->host_pasid;
+    if (s) {
+        s->pasid_translation_host_pasid_releases++;
+        trace_vtd_pasid_translation_release_host_pasid(
+            translation->guest_pasid, host_pasid, translation->users,
+            s->pasid_translation_host_pasid_releases);
+    }
+    warn_report("VT-d PASID translation release host PASID: guest PASID %u "
+                "host PASID %u users=%u",
+                translation->guest_pasid, host_pasid, translation->users);
+    iommufd_backend_host_pasid_release(translation->host_pasid_iommufd,
+                                       host_pasid);
+    translation->host_pasid = UINT32_MAX;
+    translation->host_pasid_iommufd = NULL;
+    translation->host_pasid_valid = false;
+}
+
+static bool vtd_pasid_translation_map_kvm(VTDPASIDTranslation *translation,
+                                          Error **errp)
+{
+    IntelIOMMUState *s = translation->iommu_state;
+
+    if (translation->kvm_mapped) {
+        return true;
+    }
+
+    if (!translation->host_pasid_valid) {
+        error_setg(errp, "guest PASID %u has no selected host PASID",
+                   translation->guest_pasid);
+        return false;
+    }
+
+    if (!vtd_kvm_pasid_translation(KVM_X86_PASID_TRANSLATION_MAP,
+                                   translation->guest_pasid,
+                                   translation->host_pasid, errp)) {
+        return false;
+    }
+
+    translation->kvm_mapped = true;
+    if (s) {
+        s->pasid_translation_kvm_maps++;
+        trace_vtd_pasid_translation_kvm_map(
+            translation->guest_pasid, translation->host_pasid,
+            s->pasid_translation_kvm_maps);
+    }
+    warn_report("VT-d PASID translation KVM map: guest PASID %u -> host PASID %u",
+                translation->guest_pasid, translation->host_pasid);
+    return true;
+}
+
+static bool vtd_pasid_translation_unmap_kvm(VTDPASIDTranslation *translation,
+                                            Error **errp)
+{
+    IntelIOMMUState *s = translation->iommu_state;
+
+    if (!translation->kvm_mapped) {
+        return true;
+    }
+
+    if (!vtd_kvm_pasid_translation(KVM_X86_PASID_TRANSLATION_UNMAP,
+                                   translation->guest_pasid, 0, errp)) {
+        return false;
+    }
+
+    if (s) {
+        s->pasid_translation_kvm_unmaps++;
+        trace_vtd_pasid_translation_kvm_unmap(
+            translation->guest_pasid, translation->host_pasid,
+            s->pasid_translation_kvm_unmaps);
+    }
+    warn_report("VT-d PASID translation KVM unmap: guest PASID %u host PASID %u",
+                translation->guest_pasid, translation->host_pasid);
+    translation->kvm_mapped = false;
+    return true;
+}
+
+static void vtd_pasid_translation_remove(IntelIOMMUState *s,
+                                         VTDPASIDTranslation *translation)
+{
+    uint32_t guest_pasid = translation->guest_pasid;
+    Error *local_err = NULL;
+
+    if (!vtd_pasid_translation_unmap_kvm(translation, &local_err)) {
+        error_reportf_err(local_err,
+                          "Late KVM PASID translation cleanup failed: ");
+    }
+    vtd_pasid_translation_free_fs_hwpt(translation);
+    vtd_pasid_translation_release_host_pasid(translation);
+    g_hash_table_remove(vtd_pasid_translation_cache(s),
+                        GUINT_TO_POINTER(guest_pasid));
+}
+
+static void vtd_pasid_translation_put(IntelIOMMUState *s, uint32_t guest_pasid,
+                                      uint32_t host_pasid)
+{
+    VTDPASIDTranslation *translation;
+
+    translation = vtd_pasid_translation_lookup(s, guest_pasid);
+    if (!translation) {
+        return;
+    }
+
+    if (translation->host_pasid_valid &&
+        translation->host_pasid != host_pasid) {
+        warn_report("VT-d PASID translation host PASID mismatch while "
+                    "detaching guest PASID %u: cache=%u detached=%u",
+                    guest_pasid, translation->host_pasid, host_pasid);
+        return;
+    }
+
+    if (translation->users) {
+        translation->users--;
+    }
+
+    if (!translation->users) {
+        if (translation->kvm_mapped) {
+            warn_report("VT-d PASID translation late final-user cleanup: "
+                        "guest PASID %u host PASID %u",
+                        guest_pasid, translation->host_pasid);
+        }
+        vtd_pasid_translation_remove(s, translation);
+    }
+}
+
+static void vtd_pasid_translation_remove_if_unused(IntelIOMMUState *s,
+                                                   VTDPASIDTranslation *translation)
+{
+    if (translation && !translation->users && !translation->kvm_mapped) {
+        vtd_pasid_translation_free_fs_hwpt(translation);
+        vtd_pasid_translation_release_host_pasid(translation);
+        g_hash_table_remove(vtd_pasid_translation_cache(s),
+                            GUINT_TO_POINTER(translation->guest_pasid));
+    }
+}
+
+static void vtd_pasid_translation_cache_reset(IntelIOMMUState *s)
+{
+    GHashTableIter iter;
+    VTDPASIDTranslation *translation;
+
+    if (!s->vtd_pasid_translation) {
+        return;
+    }
+
+    g_hash_table_iter_init(&iter, s->vtd_pasid_translation);
+    while (g_hash_table_iter_next(&iter, NULL, (void **)&translation)) {
+        Error *local_err = NULL;
+
+        if (!vtd_pasid_translation_unmap_kvm(translation, &local_err)) {
+            error_reportf_err(local_err,
+                              "Resetting KVM PASID translation cache failed: ");
+        }
+        vtd_pasid_translation_free_fs_hwpt(translation);
+        vtd_pasid_translation_release_host_pasid(translation);
+        g_hash_table_iter_remove(&iter);
+    }
+}
 
 static int vtd_hiod_get_pe_from_pasid(VTDAccelPASIDCacheEntry *vtd_pce,
                                       VTDPASIDEntry *pe)
@@ -123,10 +419,20 @@ static void vtd_destroy_old_fs_hwpt(VTDAccelPASIDCacheEntry *vtd_pce)
 {
     HostIOMMUDeviceIOMMUFD *hiodi =
         HOST_IOMMU_DEVICE_IOMMUFD(vtd_pce->vtd_hiod->hiod);
+    IntelIOMMUState *s = vtd_pce->vtd_hiod->iommu_state;
+    VTDPASIDTranslation *translation;
 
     if (!vtd_pce->fs_hwpt_id) {
         return;
     }
+
+    translation = vtd_pasid_translation_lookup(s, vtd_pce->pasid);
+    if (translation && translation->fs_hwpt_valid &&
+        translation->fs_hwpt_id == vtd_pce->fs_hwpt_id) {
+        vtd_pce->fs_hwpt_id = 0;
+        return;
+    }
+
     iommufd_backend_free_id(hiodi->iommufd, vtd_pce->fs_hwpt_id);
     vtd_pce->fs_hwpt_id = 0;
 }
@@ -135,9 +441,18 @@ static bool vtd_device_attach_iommufd(VTDAccelPASIDCacheEntry *vtd_pce,
                                       Error **errp)
 {
     VTDHostIOMMUDevice *vtd_hiod = vtd_pce->vtd_hiod;
+    IntelIOMMUState *s = vtd_hiod->iommu_state;
     HostIOMMUDeviceIOMMUFD *hiodi = HOST_IOMMU_DEVICE_IOMMUFD(vtd_hiod->hiod);
     VTDPASIDEntry *pe = &vtd_pce->pasid_entry;
-    uint32_t hwpt_id = hiodi->hwpt_id, pasid = vtd_pce->pasid;
+    uint32_t hwpt_id = hiodi->hwpt_id, guest_pasid = vtd_pce->pasid;
+    uint32_t host_pasid = vtd_pce->host_pasid_valid ?
+                          vtd_pce->host_pasid : UINT32_MAX;
+    VTDPASIDTranslation *translation = NULL;
+    Error *local_err = NULL;
+    bool already_attached = vtd_pce->host_pasid_valid;
+    bool attached = false;
+    bool created_fs_hwpt = false;
+    bool reused_fs_hwpt = false;
     bool ret;
 
     /*
@@ -151,25 +466,149 @@ static bool vtd_device_attach_iommufd(VTDAccelPASIDCacheEntry *vtd_pce,
         return false;
     }
 
+    if (guest_pasid != IOMMU_NO_PASID) {
+        translation = vtd_pasid_translation_get_or_create(s, guest_pasid);
+        if (translation->host_pasid_valid) {
+            if (translation->host_pasid_iommufd != hiodi->iommufd) {
+                error_setg(errp,
+                           "guest PASID %u is already translated on a different IOMMUFD backend",
+                           guest_pasid);
+                return false;
+            }
+            host_pasid = translation->host_pasid;
+            s->pasid_translation_reuses++;
+            trace_vtd_pasid_translation_reuse(
+                guest_pasid, host_pasid, translation->users,
+                s->pasid_translation_reuses);
+            warn_report("VT-d PASID translation reuse: guest PASID %u -> "
+                        "host PASID %u users=%u",
+                        guest_pasid, host_pasid, translation->users);
+        }
+    }
+
+    if (!vtd_kvm_pasid_translation(KVM_X86_PASID_TRANSLATION_ENABLE,
+                                   0, 0, errp)) {
+        return false;
+    }
+
     if (vtd_pe_pgtt_is_fst(pe)) {
-        if (!vtd_create_fs_hwpt(vtd_hiod, pe, &hwpt_id, errp)) {
-            return false;
+        if (translation && translation->fs_hwpt_valid) {
+            hwpt_id = translation->fs_hwpt_id;
+            reused_fs_hwpt = true;
+            s->pasid_translation_nested_hwpt_reuses++;
+            trace_vtd_pasid_translation_nested_hwpt_reuse(
+                guest_pasid, host_pasid, hwpt_id, translation->users,
+                s->pasid_translation_nested_hwpt_reuses);
+            warn_report("VT-d PASID translation reuse nested HWPT: "
+                        "guest PASID %u host PASID %u hwpt %u users=%u",
+                        guest_pasid, host_pasid, hwpt_id,
+                        translation->users);
+        } else {
+            if (!vtd_create_fs_hwpt(vtd_hiod, pe, &hwpt_id, errp)) {
+                return false;
+            }
+            created_fs_hwpt = true;
         }
     }
 
-    ret = host_iommu_device_iommufd_attach_hwpt(hiodi, pasid, hwpt_id, errp);
-    trace_vtd_device_attach_hwpt(hiodi->devid, pasid, hwpt_id, ret);
-    if (ret) {
-        /* Destroy old fs_hwpt if it's a replacement */
-        vtd_destroy_old_fs_hwpt(vtd_pce);
-        if (vtd_pe_pgtt_is_fst(pe)) {
-            vtd_pce->fs_hwpt_id = hwpt_id;
+    ret = host_iommu_device_iommufd_attach_guest_pasid_hwpt(
+        hiodi, guest_pasid, hwpt_id, &host_pasid, errp);
+    if (!ret) {
+        goto err_free_hwpt;
+    }
+    attached = true;
+
+    if (translation) {
+        if (translation->host_pasid_valid &&
+            translation->host_pasid != host_pasid) {
+            error_setg(errp,
+                       "guest PASID %u already maps to host PASID %u, but device selected %u",
+                       guest_pasid, translation->host_pasid, host_pasid);
+            goto err_detach;
         }
-    } else if (vtd_pe_pgtt_is_fst(pe)) {
+
+        if (!translation->host_pasid_valid) {
+            if (vtd_pasid_translation_host_in_use(s, guest_pasid,
+                                                  host_pasid)) {
+                error_setg(errp,
+                           "host PASID %u is already used by another guest PASID",
+                           host_pasid);
+                goto err_detach;
+            }
+
+            translation->host_pasid = host_pasid;
+            translation->host_pasid_iommufd = hiodi->iommufd;
+            translation->host_pasid_valid = true;
+            s->pasid_translation_selects++;
+            trace_vtd_pasid_translation_select(
+                guest_pasid, host_pasid, s->pasid_translation_selects);
+            warn_report("VT-d PASID translation select: guest PASID %u -> "
+                        "host PASID %u",
+                        guest_pasid, host_pasid);
+        }
+
+        if (created_fs_hwpt) {
+            translation->fs_hwpt_id = hwpt_id;
+            translation->fs_hwpt_iommufd = hiodi->iommufd;
+            translation->fs_hwpt_valid = true;
+            s->pasid_translation_nested_hwpt_allocs++;
+            trace_vtd_pasid_translation_nested_hwpt_alloc(
+                guest_pasid, host_pasid, hwpt_id,
+                s->pasid_translation_nested_hwpt_allocs);
+            warn_report("VT-d PASID translation select nested HWPT: "
+                        "guest PASID %u host PASID %u hwpt %u",
+                        guest_pasid, host_pasid, hwpt_id);
+        }
+
+        if (!vtd_pasid_translation_map_kvm(translation, errp)) {
+            goto err_detach;
+        }
+    }
+
+    trace_vtd_device_attach_hwpt(hiodi->devid, host_pasid, hwpt_id, ret);
+    /* Destroy old fs_hwpt if it's a replacement */
+    vtd_destroy_old_fs_hwpt(vtd_pce);
+    vtd_pce->host_pasid = host_pasid;
+    vtd_pce->host_pasid_valid = true;
+    if (!already_attached && translation) {
+        translation->users++;
+    }
+    if (translation) {
+        s->pasid_translation_attaches++;
+        trace_vtd_pasid_translation_attach(
+            hiodi->devid, guest_pasid, host_pasid, hwpt_id,
+            translation->users, already_attached, reused_fs_hwpt,
+            s->pasid_translation_attaches);
+        warn_report("VT-d PASID translation attach: dev_id %u guest PASID %u "
+                    "host PASID %u hwpt %u users=%u%s%s",
+                    hiodi->devid, guest_pasid, host_pasid, hwpt_id,
+                    translation->users, already_attached ? " replacement" : "",
+                    reused_fs_hwpt ? " shared-hwpt" : "");
+    }
+    if (vtd_pe_pgtt_is_fst(pe)) {
+        vtd_pce->fs_hwpt_id = hwpt_id;
+    }
+
+    return true;
+
+err_detach:
+    if (attached &&
+        !host_iommu_device_iommufd_detach_guest_pasid_hwpt(
+            hiodi, guest_pasid, host_pasid, &local_err) &&
+        local_err) {
+        error_reportf_err(local_err,
+                          "Detaching PASID after translation setup failure failed: ");
+    }
+err_free_hwpt:
+    if (created_fs_hwpt && (!translation || !translation->fs_hwpt_valid ||
+                            translation->fs_hwpt_id != hwpt_id)) {
         iommufd_backend_free_id(hiodi->iommufd, hwpt_id);
+    } else if (created_fs_hwpt && translation && !translation->users &&
+               !translation->kvm_mapped) {
+        vtd_pasid_translation_free_fs_hwpt(translation);
     }
-
-    return ret;
+    vtd_pasid_translation_remove_if_unused(s, translation);
+    return false;
 }
 
 static bool vtd_device_detach_iommufd(VTDAccelPASIDCacheEntry *vtd_pce,
@@ -179,12 +618,44 @@ static bool vtd_device_detach_iommufd(VTDAccelPASIDCacheEntry *vtd_pce,
     HostIOMMUDeviceIOMMUFD *hiodi = HOST_IOMMU_DEVICE_IOMMUFD(vtd_hiod->hiod);
 
     IntelIOMMUState *s = vtd_hiod->iommu_state;
-    uint32_t pasid = vtd_pce->pasid;
+    uint32_t guest_pasid = vtd_pce->pasid;
+    uint32_t host_pasid = vtd_pce->host_pasid_valid ?
+                          vtd_pce->host_pasid : guest_pasid;
+    VTDPASIDTranslation *translation = NULL;
+    Error *local_err = NULL;
+    unsigned int users_before_put = 0;
+    bool kvm_pre_unmapped = false;
     bool ret;
 
-    if (pasid != IOMMU_NO_PASID || (s->dmar_enabled && s->root_scalable)) {
-        ret = host_iommu_device_iommufd_detach_hwpt(hiodi, pasid, errp);
-        trace_vtd_device_detach_hwpt(hiodi->devid, pasid, ret);
+    if (vtd_pce->host_pasid_valid && guest_pasid != IOMMU_NO_PASID) {
+        translation = vtd_pasid_translation_lookup(s, guest_pasid);
+        if (translation) {
+            if (translation->host_pasid_valid &&
+                translation->host_pasid != host_pasid) {
+                error_setg(errp,
+                           "guest PASID %u maps to host PASID %u, but detach has %u",
+                           guest_pasid, translation->host_pasid, host_pasid);
+                return false;
+            }
+
+            users_before_put = translation->users;
+            if (translation->users <= 1 && translation->kvm_mapped) {
+                warn_report("VT-d PASID translation final-user detach: "
+                            "pre-unmapping KVM guest PASID %u host PASID %u "
+                            "before dev_id %u detach",
+                            guest_pasid, host_pasid, hiodi->devid);
+                if (!vtd_pasid_translation_unmap_kvm(translation, errp)) {
+                    return false;
+                }
+                kvm_pre_unmapped = true;
+            }
+        }
+    }
+
+    if (guest_pasid != IOMMU_NO_PASID || (s->dmar_enabled && s->root_scalable)) {
+        ret = host_iommu_device_iommufd_detach_guest_pasid_hwpt(
+            hiodi, guest_pasid, host_pasid, errp);
+        trace_vtd_device_detach_hwpt(hiodi->devid, host_pasid, ret);
     } else {
         /*
          * If DMAR remapping is disabled or guest switches to legacy mode,
@@ -197,8 +668,35 @@ static bool vtd_device_detach_iommufd(VTDAccelPASIDCacheEntry *vtd_pce,
                                            hiodi->hwpt_id, ret);
     }
 
+    if (!ret && kvm_pre_unmapped && translation) {
+        if (!vtd_pasid_translation_map_kvm(translation, &local_err)) {
+            error_reportf_err(local_err,
+                              "Re-mapping KVM PASID translation after detach failure failed: ");
+        }
+    }
+
     if (ret) {
         vtd_destroy_old_fs_hwpt(vtd_pce);
+        if (vtd_pce->host_pasid_valid) {
+            s->pasid_translation_detaches++;
+            trace_vtd_pasid_translation_detach(
+                hiodi->devid, guest_pasid, host_pasid,
+                users_before_put, users_before_put ? users_before_put - 1 : 0,
+                s->pasid_translation_detaches);
+            if (translation && users_before_put <= 1) {
+                s->pasid_translation_final_detaches++;
+                trace_vtd_pasid_translation_final_detach(
+                    hiodi->devid, guest_pasid, host_pasid,
+                    s->pasid_translation_final_detaches);
+            }
+            warn_report("VT-d PASID translation detach: dev_id %u guest PASID %u "
+                        "host PASID %u users=%u->%u",
+                        hiodi->devid, guest_pasid, host_pasid,
+                        users_before_put,
+                        users_before_put ? users_before_put - 1 : 0);
+            vtd_pasid_translation_put(s, guest_pasid, host_pasid);
+        }
+        vtd_pce->host_pasid_valid = false;
     }
 
     return ret;
@@ -274,7 +772,7 @@ void vtd_flush_host_piotlb_all_locked(IntelIOMMUState *s, uint16_t domain_id,
     }
 }
 
-static void vtd_accel_fill_pc(VTDHostIOMMUDevice *vtd_hiod, uint32_t pasid,
+static bool vtd_accel_fill_pc(VTDHostIOMMUDevice *vtd_hiod, uint32_t pasid,
                               VTDPASIDEntry *pe)
 {
     VTDAccelPASIDCacheEntry *vtd_pce;
@@ -283,14 +781,18 @@ static void vtd_accel_fill_pc(VTDHostIOMMUDevice *vtd_hiod, uint32_t pasid,
     QLIST_FOREACH(vtd_pce, &vtd_hiod->pasid_cache_list, next) {
         if (vtd_pce->pasid == pasid) {
             if (vtd_pasid_entry_compare(pe, &vtd_pce->pasid_entry)) {
+                VTDPASIDEntry old_pe = vtd_pce->pasid_entry;
+
                 vtd_pce->pasid_entry = *pe;
 
                 if (!vtd_device_attach_iommufd(vtd_pce, &local_err)) {
+                    vtd_pce->pasid_entry = old_pe;
                     error_reportf_err(local_err, "%s",
                                       "Replacing HWPT attachment failed: ");
+                    return false;
                 }
             }
-            return;
+            return true;
         }
     }
 
@@ -302,7 +804,12 @@ static void vtd_accel_fill_pc(VTDHostIOMMUDevice *vtd_hiod, uint32_t pasid,
 
     if (!vtd_device_attach_iommufd(vtd_pce, &local_err)) {
         error_reportf_err(local_err, "%s", "Attaching to HWPT failed: ");
+        QLIST_REMOVE(vtd_pce, next);
+        g_free(vtd_pce);
+        return false;
     }
+
+    return true;
 }
 
 static void vtd_accel_delete_pc(VTDAccelPASIDCacheEntry *vtd_pce,
@@ -354,6 +861,18 @@ vtd_accel_pasid_cache_invalidate_one(VTDAccelPASIDCacheEntry *vtd_pce,
          * pasid cache should be invalidated.
          */
         vtd_accel_delete_pc(vtd_pce, pc_info);
+        return;
+    }
+
+    if (vtd_pasid_entry_compare(&pe, &vtd_pce->pasid_entry)) {
+        IntelIOMMUState *s = vtd_pce->vtd_hiod->iommu_state;
+
+        s->pasid_translation_stale_invalidations++;
+        trace_vtd_pasid_translation_stale_invalidate(
+            vtd_pce->pasid, s->pasid_translation_stale_invalidations);
+        warn_report("VT-d PASID translation invalidate stale PASID cache: "
+                    "guest PASID %u", vtd_pce->pasid);
+        vtd_accel_delete_pc(vtd_pce, pc_info);
     }
 }
 
@@ -365,6 +884,28 @@ static void vtd_accel_pasid_cache_invalidate(VTDHostIOMMUDevice *vtd_hiod,
     QLIST_FOREACH_SAFE(vtd_pce, &vtd_hiod->pasid_cache_list, next, next) {
         vtd_accel_pasid_cache_invalidate_one(vtd_pce, pc_info);
     }
+}
+
+static bool vtd_accel_lazy_skip_pasid(IntelIOMMUState *s, uint32_t pasid)
+{
+    VTDPASIDTranslation *translation;
+
+    if (!s->pasid_translation_lazy || pasid == IOMMU_NO_PASID) {
+        return false;
+    }
+
+    /*
+     * After the first ENQCMD/S exit has established the VM-level translation,
+     * do not suppress later replays.  Those replays may be the only chance to
+     * attach the already-translated host PASID to another assigned device.
+     */
+    translation = vtd_pasid_translation_lookup(s, pasid);
+    if (translation && translation->kvm_mapped) {
+        return false;
+    }
+
+    return !s->pasid_translation_lazy_pasid ||
+           s->pasid_translation_lazy_pasid == pasid;
 }
 
 /*
@@ -399,8 +940,67 @@ static void vtd_sm_pasid_table_walk_one(VTDHostIOMMUDevice *vtd_hiod,
             continue;
         }
 
+        if (vtd_accel_lazy_skip_pasid(s, pasid)) {
+            Error *local_err = NULL;
+
+            if (!vtd_kvm_pasid_translation(KVM_X86_PASID_TRANSLATION_ENABLE,
+                                           0, 0, &local_err)) {
+                error_reportf_err(local_err,
+                                  "Enabling KVM PASID translation for lazy replay skip failed: ");
+            }
+            trace_vtd_pasid_translation_replay_skip(pasid);
+            if (s->pasid_translation_replay_skips < 16) {
+                warn_report("VT-d lazy PASID translation: skipped replay for "
+                            "guest PASID %u", pasid);
+            }
+            s->pasid_translation_replay_skips++;
+            continue;
+        }
+
         vtd_accel_fill_pc(vtd_hiod, pasid, &pe);
     }
+}
+
+static bool
+vtd_accel_replay_single_pasid_bind_for_dev(VTDHostIOMMUDevice *vtd_hiod,
+                                           uint32_t pasid)
+{
+    IntelIOMMUState *s = vtd_hiod->iommu_state;
+    uint64_t dev_max_pasid = 1ULL << vtd_hiod->hiod->caps.max_pasid_log2;
+    VTDContextEntry ce;
+    VTDPASIDDirEntry pdire;
+    VTDPASIDEntry pe;
+    uint32_t ce_max_pasid;
+    dma_addr_t pt_base;
+
+    if (pasid == IOMMU_NO_PASID || pasid >= dev_max_pasid) {
+        return false;
+    }
+
+    if (vtd_dev_to_context_entry(s, pci_bus_num(vtd_hiod->bus),
+                                 vtd_hiod->devfn, &ce)) {
+        return false;
+    }
+
+    ce_max_pasid = vtd_sm_ce_get_pdt_entry_num(&ce) *
+                   VTD_PASID_TABLE_ENTRY_NUM;
+    if (pasid >= ce_max_pasid) {
+        return false;
+    }
+
+    if (vtd_get_pdire_from_pdir_table(VTD_CE_GET_PASID_DIR_TABLE(&ce),
+                                      pasid, &pdire) ||
+        !vtd_pdire_present(&pdire)) {
+        return false;
+    }
+
+    pt_base = pdire.val & VTD_PASID_TABLE_BASE_ADDR_MASK;
+    if (vtd_get_pe_in_pasid_leaf_table(s, pasid, pt_base, &pe) ||
+        !vtd_pe_present(&pe)) {
+        return false;
+    }
+
+    return vtd_accel_fill_pc(vtd_hiod, pasid, &pe);
 }
 
 /*
@@ -440,6 +1040,18 @@ static void vtd_accel_replay_pasid_bind_for_dev(VTDHostIOMMUDevice *vtd_hiod,
     IntelIOMMUState *s = vtd_hiod->iommu_state;
     VTDContextEntry ce;
     int dev_max_pasid = 1 << vtd_hiod->hiod->caps.max_pasid_log2;
+
+    /*
+     * QEMU and the host iommufd/VFIO APIs reserve PASID 0 as IOMMU_NO_PASID.
+     * Do not create accelerated host PASID attachments for the guest's RID
+     * PASID entry; SVA/ENQCMD PASIDs are real non-zero PASID table entries.
+     */
+    if (start == IOMMU_NO_PASID) {
+        start++;
+        if (start >= end) {
+            return;
+        }
+    }
 
     if (!vtd_dev_to_context_entry(s, pci_bus_num(vtd_hiod->bus),
                                   vtd_hiod->devfn, &ce)) {
@@ -502,6 +1114,11 @@ void vtd_accel_pasid_cache_sync(IntelIOMMUState *s, VTDPASIDCacheInfo *pc_info)
      *
      * VTD translation callback never accesses vtd_hiod and its corresponding
      * cached pasid entry, so no iommu lock needed here.
+     *
+     * Do invalidation as a separate first phase.  A guest PASID can be shared
+     * by multiple assigned devices; replaying one device before deleting the
+     * other stale users would let the shared translation cache reuse the old
+     * host PASID/nested HWPT.
      */
     g_hash_table_iter_init(&hiod_it, s->vtd_host_iommu_dev);
     while (g_hash_table_iter_next(&hiod_it, NULL, (void **)&vtd_hiod)) {
@@ -510,19 +1127,90 @@ void vtd_accel_pasid_cache_sync(IntelIOMMUState *s, VTDPASIDCacheInfo *pc_info)
             continue;
         }
 
-        /*
-         * PASID entry removal is handled before addition intentionally,
-         * because it's unnecessary to iterate on an entry that will be
-         * removed.
-         */
         vtd_accel_pasid_cache_invalidate(vtd_hiod, pc_info);
-
-        if (pc_info->accel_pce_deleted) {
-            pc_info->accel_pce_deleted = false;
-        } else {
-            vtd_accel_replay_pasid_bind_for_dev(vtd_hiod, start, end, pc_info);
-        }
     }
+
+    g_hash_table_iter_init(&hiod_it, s->vtd_host_iommu_dev);
+    while (g_hash_table_iter_next(&hiod_it, NULL, (void **)&vtd_hiod)) {
+        if (!object_dynamic_cast(OBJECT(vtd_hiod->hiod),
+                                 TYPE_HOST_IOMMU_DEVICE_IOMMUFD)) {
+            continue;
+        }
+
+        vtd_accel_replay_pasid_bind_for_dev(vtd_hiod, start, end, pc_info);
+    }
+}
+
+bool vtd_accel_handle_pasid_translation_exit(uint32_t guest_pasid, Error **errp)
+{
+    X86IOMMUState *iommu = x86_iommu_get_default();
+    IntelIOMMUState *s;
+    VTDHostIOMMUDevice *vtd_hiod;
+    GHashTableIter hiod_it;
+    uint64_t max_pasid;
+    bool handled = false;
+
+    if (!iommu ||
+        !object_dynamic_cast(OBJECT(iommu), TYPE_INTEL_IOMMU_DEVICE)) {
+        error_setg(errp, "KVM PASID translation exit without Intel VT-d");
+        return false;
+    }
+
+    s = INTEL_IOMMU_DEVICE(iommu);
+    s->pasid_translation_exits++;
+    trace_vtd_pasid_translation_exit(guest_pasid);
+    warn_report("VT-d PASID translation exit: guest PASID %u "
+                "(exits=%" PRIu64 " maps=%" PRIu64 " failures=%" PRIu64
+                " replay_skips=%" PRIu64 ")",
+                guest_pasid, s->pasid_translation_exits,
+                s->pasid_translation_exit_maps,
+                s->pasid_translation_exit_failures,
+                s->pasid_translation_replay_skips);
+
+    if (!s->dmar_enabled || !s->root_scalable || !s->fsts || !s->pasid) {
+        s->pasid_translation_exit_failures++;
+        error_setg(errp,
+                   "KVM PASID translation exit before scalable first-stage VT-d is enabled");
+        return false;
+    }
+
+    max_pasid = 1ULL << s->pasid;
+    if (guest_pasid == IOMMU_NO_PASID || guest_pasid >= max_pasid) {
+        s->pasid_translation_exit_failures++;
+        error_setg(errp, "invalid guest PASID %u for KVM translation",
+                   guest_pasid);
+        return false;
+    }
+
+    g_hash_table_iter_init(&hiod_it, s->vtd_host_iommu_dev);
+    while (g_hash_table_iter_next(&hiod_it, NULL, (void **)&vtd_hiod)) {
+        if (!object_dynamic_cast(OBJECT(vtd_hiod->hiod),
+                                 TYPE_HOST_IOMMU_DEVICE_IOMMUFD)) {
+            continue;
+        }
+
+        handled |= vtd_accel_replay_single_pasid_bind_for_dev(vtd_hiod,
+                                                              guest_pasid);
+    }
+
+    if (!handled) {
+        s->pasid_translation_exit_failures++;
+        error_setg(errp,
+                   "no assigned IOMMUFD device has a valid PASID entry for guest PASID %u",
+                   guest_pasid);
+    } else {
+        s->pasid_translation_exit_maps++;
+        trace_vtd_pasid_translation_exit_map(guest_pasid, handled);
+        warn_report("VT-d PASID translation exit mapped guest PASID %u "
+                    "(exits=%" PRIu64 " maps=%" PRIu64 " failures=%" PRIu64
+                    " replay_skips=%" PRIu64 ")",
+                    guest_pasid, s->pasid_translation_exits,
+                    s->pasid_translation_exit_maps,
+                    s->pasid_translation_exit_failures,
+                    s->pasid_translation_replay_skips);
+    }
+
+    return handled;
 }
 
 /* Fake a global pasid cache invalidation to remove all pasid cache entries */
@@ -536,6 +1224,8 @@ void vtd_accel_pasid_cache_reset(IntelIOMMUState *s)
     while (g_hash_table_iter_next(&hiod_it, NULL, (void **)&vtd_hiod)) {
         vtd_accel_pasid_cache_invalidate(vtd_hiod, &pc_info);
     }
+
+    vtd_pasid_translation_cache_reset(s);
 }
 
 static uint64_t vtd_get_host_iommu_quirks(uint32_t type,

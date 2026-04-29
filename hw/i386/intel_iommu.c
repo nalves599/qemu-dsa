@@ -4172,6 +4172,10 @@ static const Property vtd_properties[] = {
     DEFINE_PROP_BOOL("svm", IntelIOMMUState, svm, false),
     DEFINE_PROP_BOOL("stale-tm", IntelIOMMUState, stale_tm, false),
     DEFINE_PROP_BOOL("fs1gp", IntelIOMMUState, fs1gp, true),
+    DEFINE_PROP_BOOL("x-pasid-translation-lazy", IntelIOMMUState,
+                     pasid_translation_lazy, false),
+    DEFINE_PROP_UINT32("x-pasid-translation-lazy-pasid", IntelIOMMUState,
+                       pasid_translation_lazy_pasid, 0),
 };
 
 /* Read IRTE entry with specific index */
@@ -4997,11 +5001,12 @@ static void vtd_cap_init(IntelIOMMUState *s)
     /* TODO: read cap/ecap from host to decide which cap to be exposed. */
     if (s->fsts) {
         s->ecap |= VTD_ECAP_SMTS | VTD_ECAP_FSTS;
-        if (s->fs1gp) {
-            s->cap |= VTD_CAP_FS1GP;
-        }
     } else if (s->scalable_mode) {
         s->ecap |= VTD_ECAP_SMTS | VTD_ECAP_SRS | VTD_ECAP_SSTS;
+    }
+
+    if (s->fs1gp && (s->fsts || s->scalable_mode)) {
+        s->cap |= VTD_CAP_FS1GP;
     }
 
     if (s->snoop_control) {
@@ -5540,9 +5545,11 @@ static bool vtd_decide_config(IntelIOMMUState *s, Error **errp)
         return false;
     }
 
-    if (s->fsts && s->aw_bits != VTD_HOST_AW_48BIT) {
-        error_setg(errp, "Scalable mode(x-flts=on): supported value for "
-                   "aw-bits is: %d", VTD_HOST_AW_48BIT);
+    if (s->fsts && s->aw_bits != VTD_HOST_AW_39BIT &&
+        s->aw_bits != VTD_HOST_AW_48BIT) {
+        error_setg(errp, "Scalable mode(x-flts=on): supported values for "
+                   "aw-bits are: %d, %d",
+                   VTD_HOST_AW_39BIT, VTD_HOST_AW_48BIT);
         return false;
     }
 
@@ -5622,6 +5629,9 @@ static void vtd_realize(DeviceState *dev, Error **errp)
                                       g_free, g_free);
     s->vtd_host_iommu_dev = g_hash_table_new_full(vtd_hiod_hash, vtd_hiod_equal,
                                                   g_free, vtd_hiod_destroy);
+    s->vtd_pasid_translation = g_hash_table_new_full(g_direct_hash,
+                                                     g_direct_equal, NULL,
+                                                     g_free);
     vtd_init(s);
     pci_setup_iommu(bus, &vtd_iommu_ops, dev);
     /* Pseudo address space under root PCI bus. */

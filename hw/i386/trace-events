@@ -77,6 +77,21 @@ vtd_reset_exit(void) ""
 vtd_device_attach_hwpt(uint32_t dev_id, uint32_t pasid, uint32_t hwpt_id, int ret) "dev_id %d pasid %d hwpt_id %d, ret: %d"
 vtd_device_detach_hwpt(uint32_t dev_id, uint32_t pasid, int ret) "dev_id %d pasid %d ret: %d"
 vtd_device_reattach_def_hwpt(uint32_t dev_id, uint32_t pasid, uint32_t hwpt_id, int ret) "dev_id %d pasid %d hwpt_id %d, ret: %d"
+vtd_pasid_translation_replay_skip(uint32_t pasid) "guest_pasid %u"
+vtd_pasid_translation_exit(uint32_t pasid) "guest_pasid %u"
+vtd_pasid_translation_exit_map(uint32_t pasid, bool handled) "guest_pasid %u handled %d"
+vtd_pasid_translation_select(uint32_t guest_pasid, uint32_t host_pasid, uint64_t count) "guest_pasid %u host_pasid %u count %"PRIu64
+vtd_pasid_translation_reuse(uint32_t guest_pasid, uint32_t host_pasid, uint32_t users, uint64_t count) "guest_pasid %u host_pasid %u users %u count %"PRIu64
+vtd_pasid_translation_nested_hwpt_alloc(uint32_t guest_pasid, uint32_t host_pasid, uint32_t hwpt_id, uint64_t count) "guest_pasid %u host_pasid %u hwpt_id %u count %"PRIu64
+vtd_pasid_translation_nested_hwpt_reuse(uint32_t guest_pasid, uint32_t host_pasid, uint32_t hwpt_id, uint32_t users, uint64_t count) "guest_pasid %u host_pasid %u hwpt_id %u users %u count %"PRIu64
+vtd_pasid_translation_nested_hwpt_free(uint32_t guest_pasid, uint32_t host_pasid, uint32_t hwpt_id, uint32_t users, uint64_t count) "guest_pasid %u host_pasid %u hwpt_id %u users %u count %"PRIu64
+vtd_pasid_translation_kvm_map(uint32_t guest_pasid, uint32_t host_pasid, uint64_t count) "guest_pasid %u host_pasid %u count %"PRIu64
+vtd_pasid_translation_kvm_unmap(uint32_t guest_pasid, uint32_t host_pasid, uint64_t count) "guest_pasid %u host_pasid %u count %"PRIu64
+vtd_pasid_translation_attach(uint32_t dev_id, uint32_t guest_pasid, uint32_t host_pasid, uint32_t hwpt_id, uint32_t users, bool replacement, bool shared_hwpt, uint64_t count) "dev_id %u guest_pasid %u host_pasid %u hwpt_id %u users %u replacement %d shared_hwpt %d count %"PRIu64
+vtd_pasid_translation_detach(uint32_t dev_id, uint32_t guest_pasid, uint32_t host_pasid, uint32_t users_before, uint32_t users_after, uint64_t count) "dev_id %u guest_pasid %u host_pasid %u users_before %u users_after %u count %"PRIu64
+vtd_pasid_translation_final_detach(uint32_t dev_id, uint32_t guest_pasid, uint32_t host_pasid, uint64_t count) "dev_id %u guest_pasid %u host_pasid %u count %"PRIu64
+vtd_pasid_translation_release_host_pasid(uint32_t guest_pasid, uint32_t host_pasid, uint32_t users, uint64_t count) "guest_pasid %u host_pasid %u users %u count %"PRIu64
+vtd_pasid_translation_stale_invalidate(uint32_t guest_pasid, uint64_t count) "guest_pasid %u count %"PRIu64
 
 # amd_iommu.c
 amdvi_evntlog_fail(uint64_t addr, uint32_t head) "error: fail to write at addr 0x%"PRIx64" +  offset 0x%"PRIx32

@@ -12,11 +12,17 @@
 #define HW_I386_INTEL_IOMMU_ACCEL_H
 #include CONFIG_DEVICES
 
+typedef struct VTDHostIOMMUDevice VTDHostIOMMUDevice;
+typedef struct VTDPASIDCacheInfo VTDPASIDCacheInfo;
+typedef struct PCIIOMMUOps PCIIOMMUOps;
+
 typedef struct VTDAccelPASIDCacheEntry {
     VTDHostIOMMUDevice *vtd_hiod;
     VTDPASIDEntry pasid_entry;
     uint32_t pasid;
+    uint32_t host_pasid;
     uint32_t fs_hwpt_id;
+    bool host_pasid_valid;
     QLIST_ENTRY(VTDAccelPASIDCacheEntry) next;
 } VTDAccelPASIDCacheEntry;
 
@@ -27,6 +33,8 @@ VTDHostIOMMUDevice *vtd_find_hiod_iommufd(VTDAddressSpace *as);
 void vtd_flush_host_piotlb_all_locked(IntelIOMMUState *s, uint16_t domain_id,
                                       uint32_t pasid, hwaddr addr,
                                       uint64_t npages, bool ih);
+bool vtd_accel_handle_pasid_translation_exit(uint32_t guest_pasid,
+                                             Error **errp);
 void vtd_accel_pasid_cache_sync(IntelIOMMUState *s, VTDPASIDCacheInfo *pc_info);
 void vtd_accel_pasid_cache_reset(IntelIOMMUState *s);
 void vtd_iommu_ops_update_accel(PCIIOMMUOps *ops);
@@ -56,6 +64,13 @@ static inline void vtd_flush_host_piotlb_all_locked(IntelIOMMUState *s,
                                                     uint32_t pasid, hwaddr addr,
                                                     uint64_t npages, bool ih)
 {
+}
+
+static inline bool vtd_accel_handle_pasid_translation_exit(uint32_t guest_pasid,
+                                                           Error **errp)
+{
+    error_setg(errp, "CONFIG_VTD_ACCEL is not enabled");
+    return false;
 }
 
 static inline void vtd_accel_pasid_cache_sync(IntelIOMMUState *s,
