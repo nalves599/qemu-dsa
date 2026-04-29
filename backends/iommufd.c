@@ -23,6 +23,52 @@
 #include <sys/ioctl.h>
 #include <linux/iommufd.h>
 
+static GHashTable *iommufd_host_pasid_allocations;
+
+static char *iommufd_host_pasid_key(IOMMUFDBackend *be, uint32_t host_pasid)
+{
+    return g_strdup_printf("%p:%u", be, host_pasid);
+}
+
+bool iommufd_backend_host_pasid_allocated(IOMMUFDBackend *be,
+                                          uint32_t host_pasid)
+{
+    g_autofree char *key = NULL;
+
+    if (!iommufd_host_pasid_allocations) {
+        return false;
+    }
+
+    key = iommufd_host_pasid_key(be, host_pasid);
+    return g_hash_table_contains(iommufd_host_pasid_allocations, key);
+}
+
+void iommufd_backend_host_pasid_mark_allocated(IOMMUFDBackend *be,
+                                               uint32_t host_pasid)
+{
+    if (!iommufd_host_pasid_allocations) {
+        iommufd_host_pasid_allocations = g_hash_table_new_full(g_str_hash,
+                                                               g_str_equal,
+                                                               g_free, NULL);
+    }
+
+    g_hash_table_add(iommufd_host_pasid_allocations,
+                     iommufd_host_pasid_key(be, host_pasid));
+}
+
+void iommufd_backend_host_pasid_release(IOMMUFDBackend *be,
+                                        uint32_t host_pasid)
+{
+    g_autofree char *key = NULL;
+
+    if (!iommufd_host_pasid_allocations) {
+        return;
+    }
+
+    key = iommufd_host_pasid_key(be, host_pasid);
+    g_hash_table_remove(iommufd_host_pasid_allocations, key);
+}
+
 static const char *iommufd_fd_name(IOMMUFDBackend *be)
 {
     return object_get_canonical_path_component(OBJECT(be));
@@ -549,6 +595,25 @@ bool host_iommu_device_iommufd_attach_hwpt(HostIOMMUDeviceIOMMUFD *hiodi,
     return hiodic->attach_hwpt(hiodi, pasid, hwpt_id, errp);
 }
 
+bool host_iommu_device_iommufd_attach_guest_pasid_hwpt(
+    HostIOMMUDeviceIOMMUFD *hiodi, uint32_t guest_pasid, uint32_t hwpt_id,
+    uint32_t *host_pasid, Error **errp)
+{
+    HostIOMMUDeviceIOMMUFDClass *hiodic =
+        HOST_IOMMU_DEVICE_IOMMUFD_GET_CLASS(hiodi);
+
+    if (hiodic->attach_guest_pasid_hwpt) {
+        return hiodic->attach_guest_pasid_hwpt(hiodi, guest_pasid, hwpt_id,
+                                               host_pasid, errp);
+    }
+
+    if (*host_pasid == UINT32_MAX) {
+        *host_pasid = guest_pasid;
+    }
+    g_assert(hiodic->attach_hwpt);
+    return hiodic->attach_hwpt(hiodi, *host_pasid, hwpt_id, errp);
+}
+
 bool host_iommu_device_iommufd_detach_hwpt(HostIOMMUDeviceIOMMUFD *hiodi,
                                            uint32_t pasid, Error **errp)
 {
@@ -557,6 +622,22 @@ bool host_iommu_device_iommufd_detach_hwpt(HostIOMMUDeviceIOMMUFD *hiodi,
 
     g_assert(hiodic->detach_hwpt);
     return hiodic->detach_hwpt(hiodi, pasid, errp);
+}
+
+bool host_iommu_device_iommufd_detach_guest_pasid_hwpt(
+    HostIOMMUDeviceIOMMUFD *hiodi, uint32_t guest_pasid, uint32_t host_pasid,
+    Error **errp)
+{
+    HostIOMMUDeviceIOMMUFDClass *hiodic =
+        HOST_IOMMU_DEVICE_IOMMUFD_GET_CLASS(hiodi);
+
+    if (hiodic->detach_guest_pasid_hwpt) {
+        return hiodic->detach_guest_pasid_hwpt(hiodi, guest_pasid,
+                                               host_pasid, errp);
+    }
+
+    g_assert(hiodic->detach_hwpt);
+    return hiodic->detach_hwpt(hiodi, host_pasid, errp);
 }
 
 static int hiod_iommufd_get_cap(HostIOMMUDevice *hiod, int cap, Error **errp)

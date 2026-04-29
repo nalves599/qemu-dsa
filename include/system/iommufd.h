@@ -110,6 +110,12 @@ bool iommufd_backend_invalidate_cache(IOMMUFDBackend *be, uint32_t id,
                                       uint32_t data_type, uint32_t entry_len,
                                       uint32_t *entry_num, void *data,
                                       Error **errp);
+bool iommufd_backend_host_pasid_allocated(IOMMUFDBackend *be,
+                                          uint32_t host_pasid);
+void iommufd_backend_host_pasid_mark_allocated(IOMMUFDBackend *be,
+                                               uint32_t host_pasid);
+void iommufd_backend_host_pasid_release(IOMMUFDBackend *be,
+                                        uint32_t host_pasid);
 
 bool iommufd_change_process_capable(IOMMUFDBackend *be);
 bool iommufd_change_process(IOMMUFDBackend *be, Error **errp);
@@ -149,6 +155,18 @@ struct HostIOMMUDeviceIOMMUFDClass {
     bool (*attach_hwpt)(HostIOMMUDeviceIOMMUFD *hiodi, uint32_t pasid,
                         uint32_t hwpt_id, Error **errp);
     /**
+     * @attach_guest_pasid_hwpt: attach a selected host PASID to an IOMMUFD
+     * hardware page table for a guest PASID.
+     *
+     * @guest_pasid: PASID value programmed by the guest.
+     *
+     * @host_pasid: In/Out host PASID. UINT32_MAX asks the backend to select a
+     * host PASID. Any other value asks the backend to reuse that host PASID.
+     */
+    bool (*attach_guest_pasid_hwpt)(HostIOMMUDeviceIOMMUFD *hiodi,
+                                    uint32_t guest_pasid, uint32_t hwpt_id,
+                                    uint32_t *host_pasid, Error **errp);
+    /**
      * @detach_hwpt: detach host IOMMU device from IOMMUFD hardware page table.
      * VFIO and VDPA device can have different implementation.
      *
@@ -164,11 +182,20 @@ struct HostIOMMUDeviceIOMMUFDClass {
      */
     bool (*detach_hwpt)(HostIOMMUDeviceIOMMUFD *hiodi, uint32_t pasid,
                         Error **errp);
+    bool (*detach_guest_pasid_hwpt)(HostIOMMUDeviceIOMMUFD *hiodi,
+                                    uint32_t guest_pasid,
+                                    uint32_t host_pasid, Error **errp);
 };
 
 bool host_iommu_device_iommufd_attach_hwpt(HostIOMMUDeviceIOMMUFD *hiodi,
                                            uint32_t pasid, uint32_t hwpt_id,
                                            Error **errp);
+bool host_iommu_device_iommufd_attach_guest_pasid_hwpt(
+    HostIOMMUDeviceIOMMUFD *hiodi, uint32_t guest_pasid, uint32_t hwpt_id,
+    uint32_t *host_pasid, Error **errp);
 bool host_iommu_device_iommufd_detach_hwpt(HostIOMMUDeviceIOMMUFD *hiodi,
                                            uint32_t pasid, Error **errp);
+bool host_iommu_device_iommufd_detach_guest_pasid_hwpt(
+    HostIOMMUDeviceIOMMUFD *hiodi, uint32_t guest_pasid, uint32_t host_pasid,
+    Error **errp);
 #endif
