@@ -35,6 +35,8 @@
 #define TYPE_HOST_IOMMU_DEVICE_IOMMUFD_VFIO             \
             TYPE_HOST_IOMMU_DEVICE_IOMMUFD "-vfio"
 
+#define IOMMUFD_CDEV_AUTO_HOST_PASID_BASE 3072
+
 static int iommufd_cdev_map(const VFIOContainer *bcontainer, hwaddr iova,
                             uint64_t size, void *vaddr, bool readonly,
                             MemoryRegion *mr)
@@ -344,42 +346,73 @@ static int iommufd_cdev_idxd_siov_pasid_feature_optional(
     return ret;
 }
 
-static bool iommufd_cdev_select_host_pasid(VFIODevice *vbasedev,
-                                           HostIOMMUDevice *hiod,
-                                           uint32_t guest_pasid,
-                                           uint32_t *host_pasid,
-                                           Error **errp)
+static bool iommufd_cdev_get_max_pasid(uint8_t max_pasid_log2,
+                                       uint64_t *max_pasid,
+                                       Error **errp)
 {
-    uint64_t max_pasid;
+    if (!max_pasid_log2) {
+        error_setg(errp, "host IOMMU does not report PASID support");
+        return false;
+    }
+
+    if (max_pasid_log2 >= 32) {
+        *max_pasid = (uint64_t)UINT32_MAX + 1;
+    } else {
+        *max_pasid = 1ULL << max_pasid_log2;
+    }
+
+    return true;
+}
+
+static uint32_t iommufd_cdev_host_pasid_start(VFIODevice *vbasedev,
+                                              uint64_t max_pasid,
+                                              Error **errp)
+{
+    if (vbasedev->host_pasid_base != VFIO_PASID_INVALID) {
+        if (vbasedev->host_pasid_base == IOMMU_NO_PASID) {
+            error_setg(errp, "x-host-pasid-base must not be IOMMU_NO_PASID");
+            return VFIO_PASID_INVALID;
+        }
+
+        if (vbasedev->host_pasid_base >= max_pasid) {
+            error_setg(errp,
+                       "x-host-pasid-base %u exceeds host PASID limit %"PRIu64,
+                       vbasedev->host_pasid_base, max_pasid);
+            return VFIO_PASID_INVALID;
+        }
+
+        return vbasedev->host_pasid_base;
+    }
+
+    if (max_pasid > IOMMUFD_CDEV_AUTO_HOST_PASID_BASE) {
+        return IOMMUFD_CDEV_AUTO_HOST_PASID_BASE;
+    }
+
+    return IOMMU_NO_PASID + 1;
+}
+
+static bool iommufd_cdev_select_host_pasid_range(VFIODevice *vbasedev,
+                                                 uint64_t max_pasid,
+                                                 uint32_t guest_pasid,
+                                                 uint32_t *host_pasid,
+                                                 Error **errp)
+{
+    uint32_t start;
+
+    (void)guest_pasid;
 
     if (*host_pasid != UINT32_MAX) {
         return true;
     }
 
-    if (vbasedev->host_pasid_base == VFIO_PASID_INVALID) {
-        *host_pasid = guest_pasid;
-        return true;
-    }
-
-    if (vbasedev->host_pasid_base == IOMMU_NO_PASID) {
-        error_setg(errp, "x-host-pasid-base must not be IOMMU_NO_PASID");
+    start = iommufd_cdev_host_pasid_start(vbasedev, max_pasid, errp);
+    if (start == VFIO_PASID_INVALID) {
         return false;
     }
 
-    if (hiod->caps.max_pasid_log2 >= 32) {
-        max_pasid = (uint64_t)UINT32_MAX + 1;
-    } else {
-        max_pasid = 1ULL << hiod->caps.max_pasid_log2;
-    }
-
-    if (vbasedev->host_pasid_base >= max_pasid) {
-        error_setg(errp, "x-host-pasid-base %u exceeds host PASID limit %"PRIu64,
-                   vbasedev->host_pasid_base, max_pasid);
-        return false;
-    }
-
-    if (vbasedev->host_pasid_next == VFIO_PASID_INVALID) {
-        vbasedev->host_pasid_next = vbasedev->host_pasid_base;
+    if (vbasedev->host_pasid_next == VFIO_PASID_INVALID ||
+        vbasedev->host_pasid_next < start) {
+        vbasedev->host_pasid_next = start;
     }
 
     while (vbasedev->host_pasid_next < max_pasid) {
@@ -399,9 +432,30 @@ static bool iommufd_cdev_select_host_pasid(VFIODevice *vbasedev,
         return true;
     }
 
-    error_setg(errp, "no host PASIDs available starting at %u",
-               vbasedev->host_pasid_base);
+    error_setg(errp, "no host PASIDs available starting at %u", start);
     return false;
+}
+
+static bool iommufd_cdev_select_host_pasid(VFIODevice *vbasedev,
+                                           HostIOMMUDevice *hiod,
+                                           uint32_t guest_pasid,
+                                           uint32_t *host_pasid,
+                                           Error **errp)
+{
+    uint64_t max_pasid;
+
+    if (*host_pasid != UINT32_MAX) {
+        return true;
+    }
+
+    if (!iommufd_cdev_get_max_pasid(hiod->caps.max_pasid_log2, &max_pasid,
+                                    errp)) {
+        return false;
+    }
+
+    return iommufd_cdev_select_host_pasid_range(vbasedev, max_pasid,
+                                                guest_pasid, host_pasid,
+                                                errp);
 }
 
 static int iommufd_cdev_attach_ioas_hwpt(VFIODevice *vbasedev,
@@ -500,6 +554,51 @@ static bool iommufd_cdev_configured_pasid_detach_ioas_hwpt(VFIODevice *vbasedev,
                                          errp);
 }
 
+static bool iommufd_cdev_ensure_auto_default_pasid(VFIODevice *vbasedev,
+                                                   uint8_t max_pasid_log2,
+                                                   Error **errp)
+{
+    uint32_t host_pasid = UINT32_MAX;
+    uint64_t max_pasid;
+
+    if (!vbasedev->cdev || iommufd_cdev_has_configured_pasid(vbasedev)) {
+        return true;
+    }
+
+    if (!max_pasid_log2) {
+        return true;
+    }
+
+    /*
+     * IDXD SIOV cdevs reject a plain device attach; give them a default
+     * host PASID unless the user supplied x-pasid explicitly.
+     */
+    if (!iommufd_cdev_get_max_pasid(max_pasid_log2, &max_pasid, errp)) {
+        return false;
+    }
+
+    if (!iommufd_cdev_select_host_pasid_range(vbasedev, max_pasid,
+                                              IOMMU_NO_PASID, &host_pasid,
+                                              errp)) {
+        return false;
+    }
+
+    vbasedev->pasid = host_pasid;
+    vbasedev->pasid_auto_allocated = true;
+    return true;
+}
+
+static void iommufd_cdev_release_auto_default_pasid(VFIODevice *vbasedev)
+{
+    if (!vbasedev->pasid_auto_allocated) {
+        return;
+    }
+
+    iommufd_backend_host_pasid_release(vbasedev->iommufd, vbasedev->pasid);
+    vbasedev->pasid = VFIO_PASID_INVALID;
+    vbasedev->pasid_auto_allocated = false;
+}
+
 static bool iommufd_cdev_autodomains_get(VFIODevice *vbasedev,
                                          VFIOIOMMUFDContainer *container,
                                          Error **errp)
@@ -514,6 +613,20 @@ static bool iommufd_cdev_autodomains_get(VFIODevice *vbasedev,
     uint32_t hwpt_id;
     uint8_t max_pasid_log2 = 0;
     int ret;
+
+    if (!iommufd_cdev_has_configured_pasid(vbasedev) && vbasedev->cdev) {
+        if (!iommufd_backend_get_device_info(vbasedev->iommufd,
+                                             vbasedev->devid, &type,
+                                             &caps, sizeof(caps), &hw_caps,
+                                             &max_pasid_log2, errp)) {
+            return false;
+        }
+
+        if (!iommufd_cdev_ensure_auto_default_pasid(vbasedev,
+                                                    max_pasid_log2, errp)) {
+            return false;
+        }
+    }
 
     if (iommufd_cdev_has_configured_pasid(vbasedev)) {
         flags = IOMMU_HWPT_ALLOC_PASID;
@@ -532,6 +645,7 @@ static bool iommufd_cdev_autodomains_get(VFIODevice *vbasedev,
                                                      &caps, sizeof(caps),
                                                      &hw_caps,
                                                      &max_pasid_log2, errp)) {
+                    iommufd_cdev_release_auto_default_pasid(vbasedev);
                     return false;
                 }
 
@@ -548,6 +662,7 @@ static bool iommufd_cdev_autodomains_get(VFIODevice *vbasedev,
                                             container->ioas_id, flags,
                                             IOMMU_HWPT_DATA_NONE, 0, NULL,
                                             &hwpt_id, errp)) {
+                iommufd_cdev_release_auto_default_pasid(vbasedev);
                 return false;
             }
 
@@ -556,6 +671,7 @@ static bool iommufd_cdev_autodomains_get(VFIODevice *vbasedev,
                                                                  errp);
             if (ret) {
                 iommufd_backend_free_id(container->be, hwpt_id);
+                iommufd_cdev_release_auto_default_pasid(vbasedev);
                 return false;
             }
         }
@@ -733,6 +849,7 @@ static void iommufd_cdev_detach_container(VFIODevice *vbasedev,
         if (!iommufd_cdev_configured_pasid_detach_ioas_hwpt(vbasedev, &err)) {
             error_report_err(err);
         }
+        iommufd_cdev_release_auto_default_pasid(vbasedev);
     } else if (!iommufd_cdev_pasid_detach_ioas_hwpt(vbasedev, IOMMU_NO_PASID,
                                                     &err)) {
         error_report_err(err);
@@ -1177,11 +1294,16 @@ host_iommu_device_iommufd_vfio_attach_guest_pasid_hwpt(
     VFIODevice *vbasedev = hiod->agent;
     uint32_t selected_host_pasid = *host_pasid;
     Error *local_err = NULL;
+    bool default_pasid = guest_pasid == IOMMU_NO_PASID;
     bool selected_new_host_pasid;
     int ret;
 
-    selected_new_host_pasid = selected_host_pasid == UINT32_MAX &&
-                              vbasedev->host_pasid_base != VFIO_PASID_INVALID;
+    if (default_pasid && selected_host_pasid == UINT32_MAX &&
+        vbasedev->pasid != VFIO_PASID_INVALID) {
+        selected_host_pasid = vbasedev->pasid;
+    }
+
+    selected_new_host_pasid = selected_host_pasid == UINT32_MAX;
 
     if (!iommufd_cdev_select_host_pasid(vbasedev, hiod, guest_pasid,
                                         &selected_host_pasid, errp)) {
@@ -1198,10 +1320,50 @@ host_iommu_device_iommufd_vfio_attach_guest_pasid_hwpt(
         return false;
     }
 
-    ret = iommufd_cdev_idxd_siov_pasid_feature_optional(
-        vbasedev, VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID_MAP, guest_pasid,
-        selected_host_pasid, errp);
+    if (default_pasid) {
+        ret = iommufd_cdev_idxd_siov_pasid_feature_optional(
+            vbasedev, VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID_SET_DEFAULT, 0,
+            selected_host_pasid, errp);
+    } else {
+        ret = iommufd_cdev_idxd_siov_pasid_feature_optional(
+            vbasedev, VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID_MAP, guest_pasid,
+            selected_host_pasid, errp);
+        if (!ret) {
+            Error *default_err = NULL;
+            int default_ret;
+
+            /*
+             * Linux idxd may leave dedicated kernel WQs with PASID disabled
+             * when the VDEV reports config support as fixed. In that case
+             * the kernel VDEV uses its default host PASID for WQCFG.PASID.
+             * Point that default at the first usable guest PASID mapping so
+             * completion records submitted through the guest DMA API are
+             * translated by the same nested HWPT as the guest's DMA domain.
+             */
+            default_ret = iommufd_cdev_idxd_siov_pasid_feature_optional(
+                vbasedev, VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID_SET_DEFAULT, 0,
+                selected_host_pasid, &default_err);
+            if (default_ret && default_ret != -EBUSY) {
+                warn_reportf_err(default_err,
+                                  "Setting idxd SIOV default PASID failed: ");
+            } else {
+                error_free(default_err);
+            }
+        }
+    }
     if (ret) {
+        iommufd_cdev_pasid_detach_ioas_hwpt(vbasedev, selected_host_pasid,
+                                            &local_err);
+        error_free(local_err);
+        if (selected_new_host_pasid) {
+            iommufd_backend_host_pasid_release(vbasedev->iommufd,
+                                               selected_host_pasid);
+        }
+        return false;
+    }
+
+    if (!vfio_pci_idxd_siov_ims_set_host_pasid(vbasedev,
+                                               selected_host_pasid, errp)) {
         iommufd_cdev_pasid_detach_ioas_hwpt(vbasedev, selected_host_pasid,
                                             &local_err);
         error_free(local_err);
@@ -1231,6 +1393,11 @@ host_iommu_device_iommufd_vfio_detach_guest_pasid_hwpt(
     Error **errp)
 {
     VFIODevice *vbasedev = HOST_IOMMU_DEVICE(hiodi)->agent;
+
+    if (!vfio_pci_idxd_siov_ims_reset_host_pasid(vbasedev, host_pasid,
+                                                 errp)) {
+        return false;
+    }
 
     /*
      * The idxd kernel side removes explicit guest PASID mappings when the

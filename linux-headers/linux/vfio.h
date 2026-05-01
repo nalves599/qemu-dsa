@@ -1525,6 +1525,30 @@ struct vfio_device_feature_idxd_siov_pasid {
 };
 #define VFIO_DEVICE_FEATURE_IDXD_SIOV_PASID 12
 
+/*
+ * Intel DSA SIOV IMS programming for idxd VFIO VDEVs. The VDEV exposes a
+ * virtual MSI-X table to the guest, while descriptor completion interrupts are
+ * backed by physical IMS entries. Userspace supplies the host interrupt message
+ * that backs a virtual MSI-X vector.
+ */
+struct vfio_device_feature_idxd_siov_ims {
+	__u32 op;
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_PROGRAM	0
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_CLEAR		1
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_GET		2
+	__u32 vector;
+	__aligned_u64 msg_addr;
+	__u32 msg_data;
+	__u32 host_pasid;
+	__u32 flags;
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_MASK	(1 << 0)
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_IGNORE	(1 << 1)
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_PASID	(1 << 2)
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_PENDING	(1 << 3)
+	__u32 __reserved;
+};
+#define VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS 13
+
 /* -------- API for Type1 VFIO IOMMU -------- */
 
 /**

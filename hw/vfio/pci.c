@@ -649,6 +649,105 @@ void vfio_pci_vector_init(VFIOPCIDevice *vdev, int nr)
     }
 }
 
+static uint32_t vfio_idxd_siov_ims_active_host_pasid(VFIOPCIDevice *vdev)
+{
+    if (vdev->vbasedev.idxd_siov_ims_host_pasid != VFIO_PASID_INVALID) {
+        return vdev->vbasedev.idxd_siov_ims_host_pasid;
+    }
+
+    return vdev->vbasedev.pasid;
+}
+
+static bool vfio_idxd_siov_ims_program_vector(VFIOPCIDevice *vdev,
+                                              unsigned int nr,
+                                              uint32_t host_pasid,
+                                              bool force_mask,
+                                              Error **errp)
+{
+    PCIDevice *pdev = PCI_DEVICE(vdev);
+    MSIMessage msg;
+    uint32_t flags = VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_PASID;
+    Error *local_err = NULL;
+    int ret;
+
+    if (host_pasid == VFIO_PASID_INVALID) {
+        return true;
+    }
+    if (vdev->interrupt != VFIO_INT_MSIX || !vdev->msix ||
+        !vdev->msi_vectors || nr >= vdev->msix->entries) {
+        return true;
+    }
+    if (!vdev->msi_vectors[nr].use &&
+        (!pdev->msix_entry_used || !pdev->msix_entry_used[nr])) {
+        return true;
+    }
+
+    if (force_mask || msix_is_masked(pdev, nr)) {
+        flags |= VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_F_MASK;
+    }
+
+    msg = msix_get_message(pdev, nr);
+    ret = vfio_device_idxd_siov_ims_feature(
+        &vdev->vbasedev, VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS_PROGRAM,
+        nr, msg.address, msg.data, host_pasid, flags, &local_err);
+    if (ret == -ENOTTY) {
+        error_free(local_err);
+        return true;
+    }
+    if (ret) {
+        error_propagate(errp, local_err);
+        return false;
+    }
+
+    return true;
+}
+
+bool vfio_pci_idxd_siov_ims_set_host_pasid(VFIODevice *vbasedev,
+                                           uint32_t host_pasid,
+                                           Error **errp)
+{
+    VFIOPCIDevice *vdev = vfio_pci_from_vfio_device(vbasedev);
+    unsigned int i;
+
+    if (!vdev) {
+        return true;
+    }
+    if (host_pasid == VFIO_PASID_INVALID) {
+        error_setg(errp, "invalid idxd SIOV IMS host PASID");
+        return false;
+    }
+
+    if (vdev->interrupt == VFIO_INT_MSIX && vdev->msix &&
+        vdev->msi_vectors) {
+        for (i = 0; i < vdev->msix->entries; i++) {
+            if (!vfio_idxd_siov_ims_program_vector(vdev, i, host_pasid,
+                                                   false, errp)) {
+                return false;
+            }
+        }
+    }
+
+    vbasedev->idxd_siov_ims_host_pasid = host_pasid;
+    return true;
+}
+
+bool vfio_pci_idxd_siov_ims_reset_host_pasid(VFIODevice *vbasedev,
+                                             uint32_t host_pasid,
+                                             Error **errp)
+{
+    if (vbasedev->idxd_siov_ims_host_pasid != host_pasid) {
+        return true;
+    }
+
+    vbasedev->idxd_siov_ims_host_pasid = VFIO_PASID_INVALID;
+    if (vbasedev->pasid == VFIO_PASID_INVALID) {
+        return true;
+    }
+
+    return vfio_pci_idxd_siov_ims_set_host_pasid(vbasedev, vbasedev->pasid,
+                                                 errp);
+}
+
 static int vfio_msix_vector_do_use(PCIDevice *pdev, unsigned int nr,
                                    MSIMessage *msg, IOHandler *handler)
 {
@@ -719,6 +818,16 @@ static int vfio_msix_vector_do_use(PCIDevice *pdev, unsigned int nr,
         }
     }
 
+    if (msg) {
+        Error *err = NULL;
+        uint32_t host_pasid = vfio_idxd_siov_ims_active_host_pasid(vdev);
+
+        if (!vfio_idxd_siov_ims_program_vector(vdev, nr, host_pasid,
+                                               false, &err)) {
+            warn_reportf_err(err, VFIO_MSG_PREFIX, vdev->vbasedev.name);
+        }
+    }
+
     /* Disable PBA emulation when nothing more is pending. */
     clear_bit(nr, vdev->msix->pending);
     if (find_first_bit(vdev->msix->pending,
@@ -768,6 +877,16 @@ static void vfio_msix_vector_release(PCIDevice *pdev, unsigned int nr)
                                     nr, VFIO_IRQ_SET_ACTION_TRIGGER, fd,
                                     &err)) {
             error_reportf_err(err, VFIO_MSG_PREFIX, vdev->vbasedev.name);
+        }
+    }
+
+    if (vfio_idxd_siov_ims_active_host_pasid(vdev) != VFIO_PASID_INVALID) {
+        Error *err = NULL;
+        uint32_t host_pasid = vfio_idxd_siov_ims_active_host_pasid(vdev);
+
+        if (!vfio_idxd_siov_ims_program_vector(vdev, nr, host_pasid,
+                                               true, &err)) {
+            warn_reportf_err(err, VFIO_MSG_PREFIX, vdev->vbasedev.name);
         }
     }
 }

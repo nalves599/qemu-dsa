@@ -240,6 +240,12 @@ void vfio_vga_write(void *opaque, hwaddr addr, uint64_t data, unsigned size);
  * Return: The VFIOPCIDevice on success, NULL on failure.
  */
 VFIOPCIDevice *vfio_pci_from_vfio_device(VFIODevice *vbasedev);
+bool vfio_pci_idxd_siov_ims_set_host_pasid(VFIODevice *vbasedev,
+                                           uint32_t host_pasid,
+                                           Error **errp);
+bool vfio_pci_idxd_siov_ims_reset_host_pasid(VFIODevice *vbasedev,
+                                             uint32_t host_pasid,
+                                             Error **errp);
 void vfio_sub_page_bar_update_mappings(VFIOPCIDevice *vdev);
 bool vfio_opt_rom_in_denylist(VFIOPCIDevice *vdev);
 bool vfio_config_quirk_setup(VFIOPCIDevice *vdev, Error **errp);

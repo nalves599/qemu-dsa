@@ -393,8 +393,10 @@ void vfio_device_init(VFIODevice *vbasedev, int type, VFIODeviceOps *ops,
     vbasedev->dev = dev;
     vbasedev->fd = -1;
     vbasedev->pasid = VFIO_PASID_INVALID;
+    vbasedev->pasid_auto_allocated = false;
     vbasedev->host_pasid_base = VFIO_PASID_INVALID;
     vbasedev->host_pasid_next = VFIO_PASID_INVALID;
+    vbasedev->idxd_siov_ims_host_pasid = VFIO_PASID_INVALID;
     vbasedev->use_region_fds = false;
 
     vbasedev->ram_block_discard_allowed = ram_discard;
@@ -611,6 +613,40 @@ int vfio_device_idxd_siov_pasid_feature(VFIODevice *vbasedev, uint32_t op,
                          "idxd SIOV PASID feature op %u guest PASID %u "
                          "host PASID %u failed",
                          op, guest_pasid, host_pasid);
+    }
+
+    return ret;
+}
+
+int vfio_device_idxd_siov_ims_feature(VFIODevice *vbasedev, uint32_t op,
+                                      uint32_t vector, uint64_t msg_addr,
+                                      uint32_t msg_data, uint32_t host_pasid,
+                                      uint32_t flags, Error **errp)
+{
+    uint64_t buf[DIV_ROUND_UP(sizeof(struct vfio_device_feature) +
+                              sizeof(struct vfio_device_feature_idxd_siov_ims),
+                              sizeof(uint64_t))] = {};
+    struct vfio_device_feature *feature = (struct vfio_device_feature *)buf;
+    struct vfio_device_feature_idxd_siov_ims *ims =
+        (struct vfio_device_feature_idxd_siov_ims *)feature->data;
+    int ret;
+
+    feature->argsz = sizeof(*feature) + sizeof(*ims);
+    feature->flags = VFIO_DEVICE_FEATURE_SET |
+                     VFIO_DEVICE_FEATURE_IDXD_SIOV_IMS;
+    ims->op = op;
+    ims->vector = vector;
+    ims->msg_addr = msg_addr;
+    ims->msg_data = msg_data;
+    ims->host_pasid = host_pasid;
+    ims->flags = flags;
+
+    ret = vfio_device_get_feature(vbasedev, feature);
+    if (ret) {
+        error_setg_errno(errp, -ret,
+                         "idxd SIOV IMS feature op %u vector %u "
+                         "host PASID %u failed",
+                         op, vector, host_pasid);
     }
 
     return ret;

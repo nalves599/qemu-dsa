@@ -88,8 +88,10 @@ typedef struct VFIODevice {
     HostIOMMUDevice *hiod;
     int devid;
     uint32_t pasid;
+    bool pasid_auto_allocated;
     uint32_t host_pasid_base;
     uint32_t host_pasid_next;
+    uint32_t idxd_siov_ims_host_pasid;
     IOMMUFDBackend *iommufd;
     VFIOIOASHwpt *hwpt;
     QLIST_ENTRY(VFIODevice) hwpt_next;
@@ -283,6 +285,10 @@ int vfio_device_get_feature(VFIODevice *vbasedev,
 int vfio_device_idxd_siov_pasid_feature(VFIODevice *vbasedev, uint32_t op,
                                         uint32_t guest_pasid,
                                         uint32_t host_pasid, Error **errp);
+int vfio_device_idxd_siov_ims_feature(VFIODevice *vbasedev, uint32_t op,
+                                      uint32_t vector, uint64_t msg_addr,
+                                      uint32_t msg_data, uint32_t host_pasid,
+                                      uint32_t flags, Error **errp);
 
 /**
  * Return the region info for a given region index. The region info includes
